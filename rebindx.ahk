@@ -164,8 +164,10 @@ LoadConfig(file := "") {
         
         if !hitSeparator
             RegHotkey(key, cmd, "cmd")
-        else
+        else {
+            cmd := NormalizeAction(cmd)
             RegHotkey(key, cmd, "key")
+        }
     }
 }
 
@@ -195,18 +197,18 @@ NormalizeKey(key) {
     if key = ""
         return ""
         
-    key := StrUpper(Trim(key))
+    key := Trim(key)
     key := RegExReplace(key, "\s")
     
-    key := StrReplace(key, "WIN+", "#")
-    key := StrReplace(key, "CTRL+", "^")
-    key := StrReplace(key, "ALT+", "!")
-    key := StrReplace(key, "SHIFT+", "+")
+    key := RegExReplace(key, "i)WIN\+", "#")
+    key := RegExReplace(key, "i)CTRL\+", "^")
+    key := RegExReplace(key, "i)ALT\+", "!")
+    key := RegExReplace(key, "i)SHIFT\+", "+")
     
-    key := StrReplace(key, "WIN", "#")
-    key := StrReplace(key, "CTRL", "^")
-    key := StrReplace(key, "ALT", "!")
-    key := StrReplace(key, "SHIFT", "+")
+    key := RegExReplace(key, "i)WIN", "#")
+    key := RegExReplace(key, "i)CTRL", "^")
+    key := RegExReplace(key, "i)ALT", "!")
+    key := RegExReplace(key, "i)SHIFT", "+")
     
     pos := RegExMatch(key, "[\w]")
     if pos = 0
@@ -216,7 +218,7 @@ NormalizeKey(key) {
     baseKey := SubStr(key, pos)
     
     if StrLen(baseKey) != 1 {
-        if !validKeys.Has(baseKey)
+        if !validKeys.Has(StrUpper(baseKey))
             return ""
     }
     
@@ -234,6 +236,22 @@ NormalizeKey(key) {
         return ""
         
     return key
+}
+
+NormalizeAction(action) {
+    action := Trim(action)
+    
+    action := RegExReplace(action, "i)WIN\+", "#")
+    action := RegExReplace(action, "i)CTRL\+", "^")
+    action := RegExReplace(action, "i)ALT\+", "!")
+    action := RegExReplace(action, "i)SHIFT\+", "+")
+    
+    action := RegExReplace(action, "i)WIN", "#")
+    action := RegExReplace(action, "i)CTRL", "^")
+    action := RegExReplace(action, "i)ALT", "!")
+    action := RegExReplace(action, "i)SHIFT", "+")
+    
+    return action
 }
 
 RegHotkey(key, action, type) {
@@ -283,14 +301,15 @@ BindKey(boundKey, *) {
     if pos > 1 {
         modifiers := SubStr(out, 1, pos - 1)
         baseKey := SubStr(out, pos)
-        Send(modifiers "{" baseKey "}")
+        output := modifiers "{" baseKey "}"
+        Send(output)
         
         if Settings["DoRepeatOutputs"] {
             if Settings["RepeatBuffer"] != 0
                 Sleep(Settings["RepeatBuffer"])
             baseBoundKey := RegExReplace(boundKey, "[\^!+#*~\$]")
             while GetKeyState(baseBoundKey, "P") {
-                Send(modifiers "{" baseKey "}")
+                Send(output)
                 if Settings["RepeatDelay"] != 0
                     Sleep(Settings["RepeatDelay"])
             }
@@ -467,6 +486,7 @@ TestRemap(ctrl, *) {
     if EditorState["Type"] = "cmd"
         Run(A_ComSpec " /c " action,, "Hide")
     else {
+        action := NormalizeAction(action)
         pos := RegExMatch(action, "[\w]")
         if pos > 1 {
             modifiers := SubStr(action, 1, pos - 1)
@@ -481,7 +501,7 @@ TestRemap(ctrl, *) {
 SaveRemap(ctrl, *) {
     global EditorState, CmdMap, KeyMap
     key := NormalizeKey(ctrl.Gui["Key"].Value)
-    action := Trim(ctrl.Gui["Action"].Value) ; Trim newlines/spaces
+    action := Trim(ctrl.Gui["Action"].Value)
     
     if key = "" {
         MsgBox("Invalid key format.", "Error", 48)
@@ -492,6 +512,9 @@ SaveRemap(ctrl, *) {
         MsgBox("Action cannot be empty.", "Error", 48)
         return
     }
+    
+    if EditorState["Type"] = "key"
+        action := NormalizeAction(action)
     
     RegHotkey(key, action, EditorState["Type"])
     RefreshGuiData()
