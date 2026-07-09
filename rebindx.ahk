@@ -1,5 +1,6 @@
 #Requires AutoHotkey v2.0
 #SingleInstance Force
+#UseHook
 
 ProcessSetPriority "AboveNormal"
 SetWinDelay(-1)
@@ -287,7 +288,8 @@ BindKey(boundKey, *) {
         if Settings["DoRepeatOutputs"] {
             if Settings["RepeatBuffer"] != 0
                 Sleep(Settings["RepeatBuffer"])
-            while GetKeyState(boundKey, "P") {
+            baseBoundKey := RegExReplace(boundKey, "[\^!+#*~\$]")
+            while GetKeyState(baseBoundKey, "P") {
                 Send(modifiers "{" baseKey "}")
                 if Settings["RepeatDelay"] != 0
                     Sleep(Settings["RepeatDelay"])
@@ -298,7 +300,8 @@ BindKey(boundKey, *) {
         if Settings["DoRepeatOutputs"] {
             if Settings["RepeatBuffer"] != 0
                 Sleep(Settings["RepeatBuffer"])
-            while GetKeyState(boundKey, "P") {
+            baseBoundKey := RegExReplace(boundKey, "[\^!+#*~\$]")
+            while GetKeyState(baseBoundKey, "P") {
                 Send("{" out "}")
                 if Settings["RepeatDelay"] != 0
                     Sleep(Settings["RepeatDelay"])
@@ -368,13 +371,12 @@ BuildMainGui() {
     StyleListView(LV_Key)
     
     guielements["TAB"].UseTab(3)
-    MainGui.Add("Text", "x170 y40 w700 h25 +BackgroundTrans", "ReBindX Settings")
-    MainGui.Add("Text", "x170 y+15 w300 h25 +BackgroundTrans", "Repeat outputs while held (remaps only)")
-    MainGui.Add("Text", "x170 y+15 w300 h25 +BackgroundTrans", "Repeat buffer (ms)")
-    MainGui.Add("Text", "x170 y+15 w300 h25 +BackgroundTrans", "Repeat delay (ms)")
-    MainGui.Add("Text", "x170 y+15 w300 h25 +BackgroundTrans", "Run at startup (requires admin)")
+    MainGui.Add("Text", "x170 y50 w300 h25 +BackgroundTrans", "Repeat outputs while held (remaps only)")
+    MainGui.Add("Text", "x170 y+20 w300 h25 +BackgroundTrans", "Repeat buffer (ms)")
+    MainGui.Add("Text", "x170 y+20 w300 h25 +BackgroundTrans", "Repeat delay (ms)")
+    MainGui.Add("Text", "x170 y+20 w300 h25 +BackgroundTrans", "Run at startup (requires admin)")
     
-    guielements["repeatbtn"] := MainGui.Add("Button", "x480 yp-5 w100 h30 vRepeatBtn", Settings["DoRepeatOutputs"] ? "Disable" : "Enable")
+    guielements["repeatbtn"] := MainGui.Add("Button", "x480 y45 w100 h30 vRepeatBtn", Settings["DoRepeatOutputs"] ? "Disable" : "Enable")
     guielements["repeatbtn"].OnEvent("Click", ToggleRepeat)
     MainGui.Add("Edit", "x480 y+15 w100 h30 vRepeatBuffer c" Theme["Text"], Settings["RepeatBuffer"])
     MainGui.Add("UpDown", "Range0-1000", Settings["RepeatBuffer"])
@@ -384,8 +386,7 @@ BuildMainGui() {
     guielements["startupbtn"].OnEvent("Click", ToggleStartup)
     
     guielements["TAB"].UseTab(4)
-    MainGui.Add("Text", "x170 y40 w700 h25 +BackgroundTrans", "ReBindX Usage tutorial")
-    MainGui.Add("Text", "x170 y+15 w700 +BackgroundTrans", "With the command mapper, you can map valid terminal commands to keybinds. Some examples:")
+    MainGui.Add("Text", "x170 y50 w700 +BackgroundTrans", "With the command mapper, you can map valid terminal commands to keybinds. Some examples:")
     MainGui.Add("Text", "x170 y+5 w700 +BackgroundTrans", "start chrome.exe | taskmgr | shutdown /f")
     MainGui.Add("Text", "x170 y+15 w700 +BackgroundTrans", "With the input remapper, you can remap your keyboard keys or map simpler macros to them.`nEvery input field accepts the following syntax:")
     MainGui.Add("Text", "x170 y+5 w700 +BackgroundTrans", "AHK syntax: #^!G | Text syntax: WIN+CTRL+ALT+G or WIN CTRL ALT G")
@@ -456,7 +457,7 @@ ChangeEditorType(ctrl, *) {
 TestRemap(ctrl, *) {
     global EditorState
     key := NormalizeKey(ctrl.Gui["Key"].Value)
-    action := ctrl.Gui["Action"].Value
+    action := Trim(ctrl.Gui["Action"].Value)
     
     if key = "" {
         MsgBox("Invalid key format.", "Error", 48)
@@ -480,7 +481,7 @@ TestRemap(ctrl, *) {
 SaveRemap(ctrl, *) {
     global EditorState, CmdMap, KeyMap
     key := NormalizeKey(ctrl.Gui["Key"].Value)
-    action := ctrl.Gui["Action"].Value
+    action := Trim(ctrl.Gui["Action"].Value) ; Trim newlines/spaces
     
     if key = "" {
         MsgBox("Invalid key format.", "Error", 48)
@@ -616,6 +617,8 @@ SaveBindings(*) {
 
 LoadBindings(*) {
     LoadConfig()
+    LoadTheme()
+    LoadSettings()
     RefreshGuiData()
     TrayTip(AppName, "Configuration loaded", 1)
 }
