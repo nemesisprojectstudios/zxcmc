@@ -1,0 +1,5 @@
+Resources/
+tests/
+*.ini
+*.cfg
+ANALYSIS.md
