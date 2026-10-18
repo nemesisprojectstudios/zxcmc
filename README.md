@@ -24,6 +24,9 @@ ReBindX is a keyboard remapper and command launcher for power users: bind any ke
 
 - **Command mapper** — bind a hotkey to a shell command. Actions support prefixes: none (hidden `cmd.exe`), `&` (run through the shell selected in Settings, with bash syntax validation when the shell is bash — see [Shell detection](#shell-detection--bash-validation-in-progress)), `>` (send text/keys instead of running a program), `@` (run AutoHotkey code via a temporary script), and doubled `&&`/`>>`/`@@` (literal prefix passthrough).
 - **Key remapper** — bind a hotkey to another key or combination (`!Tab`), with a repeat form (`!Tab 2` = hold Alt, press Tab twice) and full macro strings sent as-is (`{Enter}{Enter}abc`).
+- **Trigger kinds** — every command binding can trigger on a **hotkey**, a **hotstring** (typed text + ending character) or a **pixel** (screen pixel turns to/from a color); remaps stay hotkey-only. Bindings can be scoped to one program (`[ahk_exe chrome.exe]`).
+- **Macro Builder** — build macros one action at a time (key press/down/up with hold duration, waits, shell commands with wait-until-return, mouse moves with a held key, raw Send sequences), with named loops, per-macro trigger modes (press/release/repeat-while-held/pixel-watch) and a Test-run button.
+- **Profiles** — bindings, macros and repeat settings bundled per profile: switch/clone/create/rename/export/import/delete, plus copy-the-selection-to-any-profile (Save to...).
 - **Macro recorder** — record your keystrokes from the tray menu (`InputHook`-based, keyboard-only, `Esc` stops, recorded text auto-escaped for `Send`); recordings are saved into a **global macro library**.
 - **Macros tab** — a dedicated tab managing the macro library (create/edit/delete, run once as a test, and "Assign to key..."). A key remap whose output is `macro:Name` replays the named library entry, so editing a macro updates every binding that references it. The library persists as a `[Macros]` section in `keybinds.cfg`.
 - **Per-app window scoping** — append a WinTitle criterion such as `[ahk_exe chrome.exe]` to any binding to make it fire only in matching windows.
@@ -225,6 +228,20 @@ The Settings tab's *Shell for & commands* control offers the shells actually ins
 - **Bash syntax validation:** when the selected shell's Id is `bash`, `&`-commands are first written to a temp file and checked with `bash -n` via `RunWait`; a non-zero exit means the command is **not executed** — the syntax error is logged and shown in the status strip. Validation is always-on for bash (it costs milliseconds) and only for bash — other shells have incompatible syntax and could false-reject.
 - Startup cleanup of leftover temp scripts is extended to the validation files (`ReBindX_syntax_*.sh`).
 
+#### Per-profile macros and settings
+
+Macros and the three repeat settings (`DoRepeatOutputs`, `RepeatBuffer`, `RepeatDelay`) are per-profile. They persist inside each profile section:
+
+```ahk
+[Profile:Work]
+set:RepeatBuffer;120
+macro:login;user{Tab}pass{Enter}
+#L; outlook.exe
+-------------
+```
+
+A legacy global `[Macros]` section (from older versions) is read into the Default profile on load; new saves always write per-profile. Hotstring (`hs:`) and pixel (`px:`) triggers are just bindings and live on the same keypart grammar.
+
 ### Key remap outputs
 
 A *Key Remapper* action is translated to a `Send` string by three grammar forms (`BuildKeyOutput`):
@@ -272,6 +289,8 @@ Built-in presets: **Dark** `1E1E1E / 2D2D2D / FFFFFF / 9E9E9E / 255` (default), 
 
 ## Usage guide
 
+> The in-app **Usage Guide tab** is the complete reference: seven scrollable pages (Getting Started, Keys & Remaps, Commands & Shells, Macros & Builder, Hotstrings & Pixel, Profiles, Window & Files) covering every feature below in more depth, including the full key-name inventory and the complete macro token grammar.
+
 ### GUI tour
 
 The main window (borderless; title *"ReBindX - Key remapper utility"*) is organized as a left **sidebar** of action buttons, four **tabs**, and a bottom **status strip**. Hiding the window (F1, Esc, tray, or its Close event) never exits the app — it keeps running in the tray. Exit is only via the *Exit* button or tray *Exit*, both of which respect unsaved changes.
@@ -311,11 +330,23 @@ The main window (borderless; title *"ReBindX - Key remapper utility"*) is organi
 
 ### Profiles
 
-Every profile carries its own complete set of command and remap bindings, all in `keybinds.cfg` (`Default` headerless, others under `[Profile:Name]`).
+A profile bundles **bindings, macros and the three repeat settings** — everything except app-level preferences. All live in `keybinds.cfg`: `Default` is the headerless section at the top, every other profile under `[Profile:Name]`, with its macros (`macro:Name;sequence`) and settings (`set:Key;Value`) stored inside its section.
 
-- **Tray → Profiles submenu**: one radio-checked item per profile (the active one is checked); **New…** asks for a name via InputBox and creates+switches to an empty profile.
-- **Settings tab → Profile** dropdown + **Switch** — the same code path.
-- Switching unregisters all current hotkeys and registers the new profile's set; the choice is remembered (INI `ActiveProfile`) across restarts. Switching marks the config dirty.
+**The Profiles tab** (between Macros and Settings):
+
+| Control | What it does |
+|---|---|
+| **Active profile** (dropdown + **Switch**) | Lists every profile; Switch makes the selection active (unregisters/re-registers hotkeys, swaps macros and repeat settings). The tray's Profiles submenu does the same. The choice persists (INI `ActiveProfile`). |
+| **New profile...** | A dialog with three modes: *Create from current settings* (full copy of the active profile), *Clone an existing profile* (copy from any other), *Create new empty profile*. Creates and switches to the new profile. |
+| **Save** | Saves the active profile to disk. Saving into **Default** shows a one-time warning (never asked again). |
+| **Save As...** | Deep-copies the active profile (bindings + macros + settings) under a new name and switches to it. |
+| **Rename** | Type the new name into the field, press Rename. Disabled while Default is active (Default cannot be renamed). |
+| **Export... / Import...** | Writes the active profile as a single-profile importable `.cfg`; import parses a profile file into matching profiles (merge — existing profiles are kept). |
+| **Delete profile / Clear profile** | Non-Default profiles are deleted (with confirmation); Default is cleared of its contents instead. Either way the active profile's hotkeys are unregistered and Default's registered. |
+
+**Sidebar → Save to...**: copies the *selected* rows (bindings, remaps or hotstrings by id; macros by name) into any profile — creating it if needed — **without switching profiles**. Combined with multi-select this is a bulk copy between profiles.
+
+Undo (Ctrl+Z) covers every profile operation.
 
 ### Import: the confirmation gate
 

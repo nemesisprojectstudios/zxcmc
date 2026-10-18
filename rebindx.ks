@@ -4,6 +4,14 @@
 ; Keysharp port (rebindx.ks): mechanical mirror of rebindx.ahk
 ;   plus platform adaptations - see Resources/keysharp_porting_notes.md
 ;
+; Comment convention used throughout this file:
+;   ;        regular comment
+;   ; *      highlighted / important
+;   ; !      alert or warning
+;   ; ?      query / open question / runtime-verify item
+;   ; todo:  known follow-up work
+;   ; //     crossed-out code (kept as a removal trace)
+;
 ; Sections (in order):
 ;   1. Header / directives / entry point
 ;   2. class App          - all shared state (no globals anywhere)
@@ -20,6 +28,17 @@
 ; =============================================================
 
 ; ---------- 1. Header / directives ----------
+; * #SingleInstance Force: a second launch replaces the first (the
+;   "Single" exit reason skips the config save - the file may have
+;   been edited externally and must not be clobbered).
+; * #UseHook: keyboard hook for every hotkey - stops our own Send
+;   output from re-triggering our hotkeys (off-Windows the bare-name
+;   registration in HkName covers the same concern).
+; ! #Requires capability: input monitoring/control permissions -
+;   without them hotkeys and the recorder cannot work (macOS prompts
+;   at first run; Linux needs the keysharp input hook active).
+; ? ProcessSetPriority("AboveNormal") - questionable for a user
+;   utility; consider Normal if input latency ever matters.
 #Requires AutoHotkey v2.0
 #Requires capability InputMonitoring, InputControl, WindowMonitoring
 #SingleInstance Force
@@ -29,24 +48,29 @@ ProcessSetPriority("AboveNormal")
 SetWinDelay(-1)
 SetControlDelay(-1)
 
+; * startup entry point - everything below it is definitions
 InitApp()
 
 ; =============================================================
 ; 2. class App - shared state (design D-01: no global statements)
+; * every function reads and writes shared state through this class
+;   only - neither file contains a `global` keyword
 ; =============================================================
 class App {
     static Name := "ReBindX"
     static Title := "ReBindX - Key remapper utility"
     static Profiles := Map()        ; profileName -> Map(bindingId -> bindingMap)
     static ActiveProfile := "Default"
-    static ActiveHotkeys := Map()   ; bindingId -> registered callback of the ACTIVE profile
+    static ActiveHotkeys := Map()   ; "key|scope" -> dispatcher fn (ONE per hotkey VARIANT)
     static Settings := Map()
     static Shells := []            ; detected shells: Maps {Id, Name, Path, ArgStyle, Family}
     static Seq := 0                ; registration sequence: "later binding wins" per variant
     static MacroLib := Map()       ; VIEW of the active profile's macros (see ProfileMacros)
     static ProfileMacros := Map()  ; profileName -> Map(macro name -> sequence)
     static ProfileSettings := Map() ; profileName -> Map(setting key -> value)
-    static PixelWatchers := []      ; active pixel triggers: {Name, X, Y, Color, Mode, Seq, Fired, Dead}
+    static PixelWatchers := []      ; live pixel triggers: {Name, Kind, X, Y, Color, Mode,
+                                    ;  Seq, Fired, Dead} (binding kind adds Id; the Fired/Dead
+                                    ;  state survives list rebuilds)
     static UpHotkeys := Map()       ; key|scope -> fn for "key up" variants (release-trigger macros)
     static Hotstrings := Map()      ; binding id -> fn for hotstring-triggered bindings
     static LV_Hotstrings := 0      ; the Hotstrings tab list
@@ -55,13 +79,12 @@ class App {
     static ActionDlgGui := 0       ; the cached action dialog
     static ActionDlgRow := 0       ; 0 = append, else 1-based row being edited
     static EditorLastTrig := ""   ; remembers a Hotstring trigger across editor Type switches
-    static WatchFn := 0           ; stored builder-watch callback (fat arrow)
-    static BuilderW := -1         ; last observed builder client width
-    static BuilderH := -1        ; last observed builder client height
+    ; // WatchFn / BuilderW / BuilderH removed - leftovers of the abandoned
+    ; // builder resize timer watcher (porting-notes round 14)
     static Theme := Map()
-    static UndoStack := []           ; max 10 snapshots: {Profile, Bindings}
+    static UndoStack := []           ; max 10 snapshots: {Profile, Bindings, Macros}
     static IsDirty := false
-    static ExitConfirmed := false
+    ; // ExitConfirmed removed - written in ExitFunc but never read
     static CTab := 1
     static MainGui := 0
     static LV_Cmd := 0
@@ -159,6 +182,10 @@ InitApp() {
     ; --- config, GUI, theme, icons, tooltips ---
     report := []
     LoadConfig(App.ConfigFile, &report)
+    ; ! hand-edited cfg damage is reported at launch too - but never
+    ;   under --silent, where a modal dialog would block invisibly
+    if (App.Settings["GuiVisible"])
+        ShowCfgReport(report)
     BuildMainGui()
     ApplyTheme()
     InitRowIcons()
@@ -191,12 +218,12 @@ JoinPath(parts*) {
     ; every path off-Windows; proof: a file literally named
     ; dist\rebindxsettings.ini produced by a real run).
     sep := InStr(A_Temp, "/") ? "/" : "\"   ; A_Temp starts with "/" on Unix
-    ; A_DirSeparator is Full per the current docs, but the installed
-    ; Keysharp build lacks it: reading it yields null, and (null != "")
-    ; is TRUE in Keysharp - so a simple emptiness check happily
-    ; overwrote the heuristic WITH null (that is exactly how the
-    ; UnsetError survived the first fix). Only a literal separator
-    ; value may override the heuristic.
+    ; ! A_DirSeparator is Full per the current docs, but the installed
+    ;   Keysharp build lacks it: reading it yields null, and (null != "")
+    ;   is TRUE in Keysharp - a simple emptiness check happily
+    ;   overwrote the heuristic WITH null (that is exactly how the
+    ;   UnsetError survived the first fix). Only a literal separator
+    ;   value may override the heuristic.
     try if (A_DirSeparator = "/" || A_DirSeparator = "\")
         sep := A_DirSeparator
     result := ""
@@ -214,9 +241,10 @@ JoinPath(parts*) {
 }
 
 ; Timestamped line appended to %APPDATA%\ReBindX\error.log.
-; Never throws (design D-08); parent dir created lazily. Entries are
-; capped so a huge imported config cannot balloon the log, and
-; payload text is not stored in full (security review F8).
+; ! Must never throw (design D-08): logging is the last line of
+;   defense - a throw here would kill the handler being logged.
+; Parent dir is created lazily; entries are capped at 2000 chars so a
+; huge imported config cannot balloon the log (security review F8).
 LogError(msg) {
     try {
         if (StrLen(msg) > 2000)
@@ -242,10 +270,11 @@ Notify(msg, *) {
 }
 
 ; Transient feedback on the bottom status strip; auto-clears
-; after 4 s through ONE managed timer (never stacks timers).
-; TrayTip on non-Windows builds the notification GVariant from a
-; NULL string on this build (GLib-CRITICAL spam) - notifications
-; stay status-strip-only there (user-approved trade).
+; after 4 s through ONE managed timer.
+; * the -4000 one-shot timer is re-armed per message, never stacked
+; ! TrayTip on non-Windows builds the notification GVariant from a
+;   NULL string on this build (GLib-CRITICAL spam) - notifications
+;   stay status-strip-only there (user-approved trade).
 SetStatus(msg) {
     if !App.Ui.Has("Status")
         return
@@ -279,6 +308,23 @@ CountAllBindings() {
     for , profile in App.Profiles
         n += profile.Count
     return n
+}
+
+; ! Never-throw integer parse for values that may come from config
+;   files, INI files or UI controls: returns `def` when the value is
+;   blank or non-numeric ("abcd"), otherwise the integer (decimal
+;   text like "250.0" truncates; "-13" parses - callers clamp).
+SafeInt(v, def) {
+    try {
+        if IsInteger(v)
+            return Integer(v)
+        v := Trim("" v)
+        if RegExMatch(v, "^-?\d+(\.\d+)?$")
+            return Integer(RegExReplace(v, "\.\d+$", ""))
+    } catch as Err {
+        ; a sanitizer must never throw
+    }
+    return def
 }
 
 ; --- theme.cfg (feature 8; read with FileRead, D-05) ---
@@ -331,10 +377,12 @@ LoadTheme() {
     ; never abort GUI construction downstream (review finding 6).
     for key, val in fileVals {
         if (key = "Transparency") {
-            if val is Integer && (val >= 0 && val <= 255)
+            ; ! 0 = a fully transparent (invisible, unrecoverable)
+            ;   window - clamp at 16 so a hand-set 0 stays faint but usable
+            if val is Integer && (val >= 16 && val <= 255)
                 theme[key] := val
             else
-                LogError("theme: invalid Transparency '" val "' - using preset")
+                LogError("theme: invalid Transparency '" val "' (16..255) - using preset")
         } else {
             if RegExMatch(val, "^[0-9A-Fa-f]{6}$")
                 theme[key] := val
@@ -412,12 +460,12 @@ DetectFileBOM(file) {
 ; One-time settings-INI normalization: rewrite as UTF-16 with
 ; BOM unless the file already is UTF-16. Never converts TO UTF-8.
 EnsureIniUtf16(file) {
-    ; .ks divergence (final review F4): Keysharp's IniRead/IniWrite are
-    ; .NET-based and write plain BOM-less text (proven by the
-    ; dist\rebindxsettings.ini artifact a real run produced), so the
-    ; normalization target here is BOM-less UTF-8 ("UTF-8-RAW") -
-    ; NOT the Win32-style UTF-16 that rebindx.ahk targets. Either
-    ; suite reads the other's output for the ASCII values we store.
+    ; ! .ks divergence (final review F4): Keysharp's IniRead/IniWrite are
+    ;   .NET-based and write plain BOM-less text (proven by the
+    ;   dist\rebindxsettings.ini artifact a real run produced), so the
+    ;   normalization target here is BOM-less UTF-8 ("UTF-8-RAW") -
+    ;   NOT the Win32-style UTF-16 that rebindx.ahk targets. Either
+    ;   suite reads the other's output for the ASCII values we store.
     if !FileExist(file)
         return true
     bom := DetectFileBOM(file)
@@ -673,10 +721,10 @@ DetectShells() {
             AddDetectedShell("bash", "bash", "/bin/bash")
     }
 #endif
-    ; paranoia: never leave the list empty - the DDL (and the shell
-    ; selection) would have nothing to show. The entry is created
-    ; even when its path does not exist: the user sees the error at
-    ; run time, not a broken DDL.
+    ; * paranoia: never leave the list empty - the DDL (and the shell
+    ;   selection) would have nothing to show. The entry is created
+    ;   even when its path does not exist: the user sees the error at
+    ;   run time, not a broken DDL.
     if (App.Shells.Length = 0) {
 #if WINDOWS
         AddDetectedShell("cmd", "cmd", A_ComSpec)
@@ -868,6 +916,11 @@ LoadConfig(file, &report, register := true) {
         if (SubStr(keypart, 1, 6) = "macro:" || SubStr(keypart, 1, 4) = "set:") {
             ; per-profile macro and settings entries live inside the section
             k := SubStr(keypart, 1, 6) = "macro:" ? SubStr(keypart, 7) : SubStr(keypart, 5)
+            if (k = "") {
+                report.Push({Line: lineNo, Text: raw, Reason: "empty macro/set name"})
+                LogError("cfg line " lineNo ": empty macro/set name - skipped")
+                continue
+            }
             v := StrReplace(payload, "{SEMICOLON}", ";")
             if (SubStr(keypart, 1, 6) = "macro:")
                 newPMacros[curProfileName][k] := v
@@ -934,10 +987,11 @@ LoadConfig(file, &report, register := true) {
     want2 := App.Settings["ActiveProfile"]
     App.ActiveProfile := (want2 != "" && newProfiles.Has(want2)) ? want2 : "Default"
     SetProfileView(App.ActiveProfile)
-    App.MacroLib := App.ProfileMacros[App.ActiveProfile]
+    ; // App.MacroLib := App.ProfileMacros[App.ActiveProfile] - removed:
+    ; // redundant, SetProfileView already pointed the view at the profile
     if !App.Profiles.Has("Default")
         App.Profiles["Default"] := Map()
-    want := App.Settings["ActiveProfile"]
+    ; // want := App.Settings["ActiveProfile"] - removed: dead local
     App.Settings["ActiveProfile"] := App.ActiveProfile
     if (register)
         RegisterAllHotkeys()
@@ -970,10 +1024,10 @@ ShowCfgReport(report) {
 ; Write every profile per the section-2 grammar. Default profile
 ; is headerless (old AHK versions can still read the file); every
 ; other profile gets its [Profile:Name] header. CRLF line endings,
-; UTF-8 without BOM ("UTF-8-RAW"). The write is ATOMIC: the text
-; goes to a .tmp file which then replaces the target via FileMove,
-; so a crash / disk-full / AV lock can never destroy the old config
-; (security review F2).
+; UTF-8 without BOM ("UTF-8-RAW").
+; * The write is ATOMIC: the text goes to a .tmp file which then
+;   replaces the target via FileMove, so a crash / disk-full / AV
+;   lock can never destroy the old config (security review F2).
 SaveConfig(file := "") {
     if (file = "")
         file := App.ConfigFile
@@ -1007,9 +1061,9 @@ BuildConfigText() {
     ps := App.ProfileSettings[App.ActiveProfile]
     for , k in ["DoRepeatOutputs", "RepeatBuffer", "RepeatDelay"]
         ps[k] := App.Settings[k]
-    ; The Default profile is written FIRST, explicitly by name, so the
-    ; output never depends on Map enumeration order (AHK Maps keep
-    ; insertion order, but Keysharp's are sorted before enumeration).
+    ; * The Default profile is written FIRST, explicitly by name, so
+    ;   the output never depends on Map enumeration order (AHK Maps
+    ;   keep insertion order, Keysharp's are sorted before enumeration).
     text := ""
     first := true
     if App.Profiles.Has("Default") {
@@ -1053,8 +1107,9 @@ ProfileSectionText(name, profile) {
     return s
 }
 
-; "*" prefix for disabled, "[scope]" suffix for scoped bindings,
-; {SEMICOLON} escaping for literal semicolons.
+; "*" prefix for disabled, "[scope]" suffix for scoped bindings.
+; * {SEMICOLON} escaping makes literal semicolons round-trip - the
+;   grammar's one hard separator.
 FormatBindingLine(b) {
     keyText := (b["Enabled"] ? "" : "*") . b["Key"] . (b["Scope"] != "" ? "[" b["Scope"] "]" : "")
     return keyText ";" StrReplace(b["Action"], ";", "{SEMICOLON}")
@@ -1062,10 +1117,13 @@ FormatBindingLine(b) {
 
 ; --- Load / Save / Import / Export button + tray flows ---
 
+; Sidebar/tray Save: write keybinds.cfg atomically.
 SaveBindings(*) {
     SaveConfig(App.ConfigFile)
 }
 
+; Apply: identical to Save (kept as its own sidebar button for muscle
+; memory - hotkey changes apply live, saving persists them).
 ApplyBindings(*) {
     SaveBindings()
 }
@@ -1229,11 +1287,11 @@ GetBinding(id) {
 }
 
 HkName(key) {
-    ; Windows: the "$" hook prefix stops our own Send from re-firing
-    ; our hotkeys. Off-Windows there is no RegisterHotkey hook
-    ; convention, and a user runtime test under Hyprland produced
-    ; GLib-CRITICAL portal warnings with prefixed names - register
-    ; bare names there.
+    ; ! Windows: the "$" hook prefix stops our own Send from re-firing
+    ;   our hotkeys. Off-Windows there is no RegisterHotkey hook
+    ;   convention, and a user runtime test under Hyprland produced
+    ;   GLib-CRITICAL portal warnings with prefixed names - register
+    ;   bare names there.
 #if WINDOWS
     return "$" key
 #else
@@ -1242,7 +1300,7 @@ HkName(key) {
 }
 
 ; --- Hotkey variant DISPATCHER architecture (runtime round 3) ---
-; One hotkey VARIANT per unique Key+Scope carries ONE dispatcher
+; * One hotkey VARIANT per unique Key+Scope carries ONE dispatcher
 ; callback that is installed a single time and NEVER swapped. At
 ; fire time the dispatcher resolves the effective binding: the
 ; highest-Seq ENABLED binding with that Key+Scope ("later
@@ -1299,6 +1357,10 @@ RegHotkey(type, keyText, scope, action, enabled) {
 ; Register one hotstring binding. The callback is per-binding, so a
 ; later binding for the same text replaces the earlier one - the
 ; same "later wins" rule as hotkey variants.
+; ? under Linux the trigger only fires when the keysharp input hook
+;   is active AND an ending character is typed
+; ? the typed trigger is NOT auto-erased (callback hotstrings never
+;   backspace) - see the round-113 report, auto-erase is the follow-up
 RegisterHotstringBinding(id, key, scope) {
     text := SubStr(key, 4)
     fn := HsDispatch.Bind(id)
@@ -1334,6 +1396,10 @@ EnsureVariant(key, scope) {
         return
     fn := BindingDispatch.Bind(key, scope)
     App.ActiveHotkeys[vkey] := fn
+    ; ! the HotIf criterion is set explicitly and reset after: a
+    ;   leaked criterion would register the NEXT variant under the
+    ;   wrong window rule (facts 3f thread gotcha) - same pattern at
+    ;   every other Hotkey()/Hotstring() registration site
     if (scope != "")
         HotIfWinActive(scope)
     else
@@ -1389,7 +1455,9 @@ BindingDispatch(key, scope, *) {
         BindKey(id)
 }
 
-; Highest-Seq enabled binding for a Key+Scope ("later wins").
+; * Highest-Seq enabled binding for a Key+Scope ("later wins") -
+;   resolved at FIRE time, so add/delete/toggle never needs to
+;   re-register the variant.
 EffectiveBindingId(key, scope) {
     best := "", bestSeq := -1
     for id, b in ActiveProfileMap() {
@@ -1401,9 +1469,10 @@ EffectiveBindingId(key, scope) {
     return best
 }
 
-; Turn off every registered variant of the active profile. Keys are
-; snapshotted before iterating (BUG-05); TargetError is expected and
-; logged only (facts 3b). Exception-safe by design.
+; Turn off every registered variant of the active profile.
+; ! Keys are snapshotted before iterating: deleting from a Map
+;   while enumerating it skips entries (BUG-05). TargetError is
+;   expected and logged only (facts 3b). Exception-safe by design.
 UnregisterAllHotkeys() {
     vkeys := []
     for vkey, fn in App.ActiveHotkeys
@@ -1761,7 +1830,7 @@ class Tips {
     }
 }
 
-; UI font family, resolved ONCE and cached: passing an EMPTY family
+; * UI font family, resolved ONCE and cached: passing an EMPTY family
 ; string to SetFont made Keysharp resolve per call (a slow fontconfig
 ; path - user report: multi-second freeze of the main window and of
 ; the editor's later-created controls). Off-Windows the desktop
@@ -1856,13 +1925,12 @@ BuildMainGui() {
     lblW := 330
     ctlX := tabX + lblW + 10              ; settings control column (512)
     rowH := 44                            ; settings row pitch (GTK combos ~32px tall)
-    ; tabH derivation: the Usage Guide tab is the tallest content. Its
-    ; eight Text blocks auto-height to 42 wrapped lines at w702 =
-    ; ~680px (Win32/Segoe) to ~756px (Eto/GTK wide-font worst case),
-    ; + 7 inter-block y+m gaps (84px), stacked from tabY0 56:
-    ;   56 + 756 = 812 <= tab display bottom (10 + 820 - ~8) = 822.
-    ; Any smaller tabH clips the bottom blocks (the old 540 clipped
-    ; ~170px even under AutoHotkey metrics).
+    ; tabH derivation: the Usage Guide is the tallest tab - an inner
+    ; Tab3 with seven word-wrapped Text pages that fit the fixed page
+    ; box (no scrolling; +ScrollBars proved invalid on Keysharp,
+    ; round 109). 820 keeps every page readable at Win32/Segoe
+    ; metrics with headroom for Eto/GTK wide-font rendering; it also
+    ; sets the window's lower size bound.
     ; Drift guard: Show() call sites outside this function use
     ; Consts.WinW/WinH; fail loudly (log) if the two ever diverge.
     if (contentX + contentW + marginX != Consts.WinW)
@@ -1959,28 +2027,28 @@ BuildMainGui() {
     tabs.UseTab(5)
     ; row 1: active profile identity
     g.Add("Text", "xc+14 yc+16 w110 h24 +BackgroundTrans", "Active profile:")
-    App.Ui["ProfileDDL"] := g.Add("DDL", "xc+128 yc+8 w170 vProfDDL", [])
-    App.Ui["ProfileSwitchBtn"] := g.Add("Button", "xc+328 yc+8 w100 h28" BtnBg(), "Switch")
+    App.Ui["ProfileDDL"] := g.Add("DDL", "xc+110 yc+8 w170 vProfDDL", [])
+    App.Ui["ProfileSwitchBtn"] := g.Add("Button", "xc+315 yc+8 w100 h28" BtnBg(), "Switch")
     App.Ui["ProfileSwitchBtn"].OnEvent("Click", OnProfileSwitchBtn)
-    ; row 2: creation
+    ; row 2: creation and deletion
     App.Ui["PNewBtn"] := g.Add("Button", "xc+10 yc+64 w120 h28" BtnBg(), "New profile...")
     App.Ui["PNewBtn"].OnEvent("Click", ProfileNewDialog)
+    App.Ui["PDeleteBtn"] := g.Add("Button", "xc+140 yc+64 w120 h28" BtnBg(), "Delete profile")
+    App.Ui["PDeleteBtn"].OnEvent("Click", ProfileDeleteOrClear)
     ; row 3: save / identity ops
-    App.Ui["PSaveBtn"] := g.Add("Button", "xc+10 yc+110 w100 h28" BtnBg(), "Save")
+    App.Ui["PSaveBtn"] := g.Add("Button", "xc+10 yc+120 w120 h28" BtnBg(), "Save")
     App.Ui["PSaveBtn"].OnEvent("Click", ProfileSave)
-    App.Ui["PSaveAsBtn"] := g.Add("Button", "xc+120 yc+110 w100 h28" BtnBg(), "Save As...")
+    App.Ui["PSaveAsBtn"] := g.Add("Button", "xc+140 yc+120 w120 h28" BtnBg(), "Save As...")
     App.Ui["PSaveAsBtn"].OnEvent("Click", ProfileSaveAs)
     ; row 4: file / profile ops
-    App.Ui["PExportBtn"] := g.Add("Button", "xc+10 yc+158 w100 h28" BtnBg(), "Export...")
+    App.Ui["PExportBtn"] := g.Add("Button", "xc+10 yc+168 w120 h28" BtnBg(), "Export...")
     App.Ui["PExportBtn"].OnEvent("Click", ProfileExport)
-    App.Ui["PImportBtn"] := g.Add("Button", "xc+120 yc+158 w100 h28" BtnBg(), "Import...")
+    App.Ui["PImportBtn"] := g.Add("Button", "xc+140 yc+168 w120 h28" BtnBg(), "Import...")
     App.Ui["PImportBtn"].OnEvent("Click", ProfileImport)
-    App.Ui["PDeleteBtn"] := g.Add("Button", "xc+230 yc+158 w130 h28" BtnBg(), "Delete profile")
-    App.Ui["PDeleteBtn"].OnEvent("Click", ProfileDeleteOrClear)
     ; row 5: rename target field (Rename uses this name)
-    g.Add("Text", "xc+10 yc+210 w400 h20 +BackgroundTrans", "Rename target: type the new name for the ACTIVE profile, then press Rename.")
-    App.Ui["ProfNameEdit"] := g.Add("Edit", "xc+10 yc+240 w200 h22 vProfName c" App.Theme["Text"] " +Background" App.Theme["Control"], App.ActiveProfile)
-    App.Ui["PRenameBtn"] := g.Add("Button", "xc+220 yc+240 w100 h28" BtnBg(), "Rename")
+    g.Add("Text", "xc+10 yc+220 w460 h20 +BackgroundTrans", "Rename target: type the new name for the ACTIVE profile:")
+    App.Ui["ProfNameEdit"] := g.Add("Edit", "xc+10 yc+260 w200 h22 vProfName c" App.Theme["Text"] " +Background" App.Theme["Control"], App.ActiveProfile)
+    App.Ui["PRenameBtn"] := g.Add("Button", "xc+220 yc+260 w100 h28" BtnBg(), "Rename")
     App.Ui["PRenameBtn"].OnEvent("Click", ProfileRename)
 
     ; -- Tab 6: Settings --
@@ -2035,35 +2103,26 @@ BuildMainGui() {
     tabs.UseTab(7)
     SetUIThemeFont(g, "s8 c" App.Theme["Text"])
     guide := g.Add("Tab3", "xc+4 yc+18 w" (contentW - 8) " h" (tabH - 36) " c" App.Theme["Text"]
-        , ["Keys and Remaps", "Commands and Profiles", "Window and Files"])
+        , ["Getting Started", "Keys & Remaps", "Commands & Shells", "Macros & Builder", "Hotstrings & Pixel", "Profiles", "Window & Files"])
     App.Ui["GuideTabs"] := guide
     App.Ui["GuideTxts"] := []
-    ; guide texts: 10px inside the guide tab, EXPLICIT heights (GTK
-    ; auto-height under-measures multi-line text -> overlap; user report)
-    gtW := contentW - 28
+    gw := contentW - 28
+    ; one word-wrapped Text per sub-tab; the per-page content fits
+    ; the fixed page box
     guide.UseTab(1)
-    App.Ui["GuideTxts"].Push(g.Add("Text", "xc+10 yc+10 w" gtW " h115 +BackgroundTrans"
-        , "ReBindX maps keys to commands and to other keys. All bindings live in keybinds.cfg next to this script; use Save to write the file and Load to re-read it.`n`nKEY SYNTAX`n- AHK symbols: # = Win, ^ = Ctrl, ! = Alt, + = Shift (example: #^G = Win+Ctrl+G)`n- Text syntax is also accepted: WIN+CTRL+ALT+G, with or without plus signs between the words`n- Single characters are written as-is: any letter A-Z or digit 0-9"))
-    App.Ui["GuideTxts"].Push(g.Add("Text", "xc+10 y+m w" gtW " h100 +BackgroundTrans"
-        , "KEY NAMES AND GRAMMAR`n- Multi-character keys use their full names (complete list on the Window and Files page)`n- A literal semicolon inside an action is written as {SEMICOLON}`n- Prefix a binding with * to save it disabled: *#Z;start chrome`n- Append a window title in brackets to scope a binding to one program: #Z[ahk_exe chrome.exe];start chrome"))
-    App.Ui["GuideTxts"].Push(g.Add("Text", "xc+10 y+m w" gtW " h100 +BackgroundTrans"
-        , "REMAPS AND MACROS`n- A remap output is a key with optional modifiers: G, !F4 or ^c`n- A repeat count is supported: !Tab 2 holds Alt and presses Tab twice`n- Macro strings are sent as they are, for example {Enter}{Enter}abc`n- Record Macro (tray menu) records your keystrokes; press Esc to stop; mouse clicks are not recorded"))
-    App.Ui["GuideTxts"].Push(g.Add("Text", "xc+10 y+m w" gtW " h105 +BackgroundTrans"
-        , "MACROS`n- The Macros tab manages a library of reusable Send sequences`n- Record Macro (tray menu) captures keystrokes into the library; press Esc to stop`n- 'Assign to key...' creates a remap whose output is macro:Name, so editing the macro updates every binding that uses it`n- Run once sends the sequence to the active window as a test`n- Pixel-watch macros fire from a background watcher that polls the pixel while ReBindX runs"))
+    App.Ui["GuideTxts"].Push(g.Add("Text", "xc+10 yc+10 w" gw " h" (tabH - 76) " +BackgroundTrans -Wrap", "GETTING STARTED`n- ReBindX maps keys to commands and other keys, manages macros, hotstrings, pixel triggers and profiles.`n- Everything lives in keybinds.cfg next to this script`n- Use Save to write it, Load to re-read it, and profile Save/Import for variants.`n`nQUICK START`n- Press + Add Binding, pick a trigger type, enter the action, Save`n- F1 shows/hides this window at any time (you can even rebind F1 itself)`n- Everything is reachable from the tray menu too`n`nTHE FOUR CONCEPTS`n- BINDINGS: a trigger (hotkey, hotstring or pixel) fires an action`n- MACROS: reusable Send sequences, built action-by-action in the Builder`n- PROFILES: independent sets of bindings, macros and settings`n- TRIGGERS: what makes something fire - key press, typed text, or a pixel turning a color`n`nWHERE THINGS LIVE`n- Command Mapper tab: hotkey/hotstring/pixel -> command bindings`n- Key Remapper tab: hotkey -> key/macro output bindings`n- Hotstrings tab: typed-text triggers and their replacements`n- Macros tab: the macro library (New..., Edit..., Builder...)`n- Profiles tab: save/switch/clone/import/export profiles"))
     guide.UseTab(2)
-    App.Ui["GuideTxts"].Push(g.Add("Text", "xc+10 yc+10 w" gtW " h170 +BackgroundTrans"
-        , "COMMAND PREFIXES (Command Mapper actions)`n- &command runs through the shell selected in Settings (the list shows the shells detected on this device), hidden or visible per the console setting; bash commands are syntax-checked before they run`n- >text sends text or keys instead of running a program`n- @code runs AutoHotkey code via a temporary .ahk file (not available in compiled builds)`n- A doubled prefix (&&, >> or @@) passes the extra character through to the default handler`n- Anything without a prefix runs hidden through the shell selected in Settings instead of cmd.exe (Keysharp divergence: cmd.exe does not exist off-Windows)"))
-    App.Ui["GuideTxts"].Push(g.Add("Text", "xc+10 y+m w" gtW " h100 +BackgroundTrans"
-        , "PROFILES`n- keybinds.cfg holds one headerless Default profile plus any number of [Profile:Name] sections`n- Every profile carries its own complete set of command and remap bindings`n- Switch profiles from the tray icon (Profiles) or from the Settings tab; the active profile is remembered across restarts"))
+    App.Ui["GuideTxts"].Push(g.Add("Text", "xc+10 yc+10 w" gw " h" (tabH - 76) " +BackgroundTrans -Wrap", "KEY SYNTAX`n- AHK symbols: # = Win, ^ = Ctrl, ! = Alt, + = Shift (example: #^G = Win+Ctrl+G)`n- Text syntax also accepted: WIN+CTRL+ALT+G, with or without plus signs`n- Single characters written as-is: A-Z, 0-9`n`nKEY NAMES`n- Multi-character keys use their full names: Escape, Tab, Enter, Space, Backspace, Delete, Insert, Home, End, PgUp, PgDn, arrows, F1-F24`n- Numpad: Numpad0-9, NumpadEnter, NumpadAdd/Sub/Mult/Div/Dot, NumpadIns/Del/Up/Down/Left/Right/Home/End/PgUp/PgDn`n- System: AppsKey, PrintScreen, Pause, ScrollLock, CapsLock`n- Mouse: LButton, RButton, MButton, XButton1, XButton2`n- Media/Internet: Media_Play_Pause, Media_Next/Prev/Stop, Volume_Mute/Up/Down, Browser_Back/Forward/Refresh/Stop/Search/Favorites/Home`n`nREMAP OUTPUTS`n- Single key: G, !F4, ^c`n- Repeat form: !Tab 2 holds Alt and presses Tab twice`n- Macro string: sent as-is, e.g. {Enter}{Enter}abc`n`nWINDOW SCOPES`n- Append [wintitle] to scope a binding to one program: #Z[ahk_exe chrome.exe];start chrome`n- Works for hotkey AND hotstring triggers`n- The binding only fires while that window is active`n`nCONFIG GRAMMAR`n- key;action  - one binding per line`n- *key;action  - the * prefix saves the binding DISABLED`n- A line of 3+ dashes separates command from key-remap sections`n- [Profile:Name] starts a new profile; [Macros] is the legacy global-macro section (read into Default)`n- macro:Name;sequence and set:Key;Value lines store per-profile macros/settings`n- {SEMICOLON} escapes a literal semicolon inside an action"))
     guide.UseTab(3)
-    App.Ui["GuideTxts"].Push(g.Add("Text", "xc+10 yc+10 w" gtW " h130 +BackgroundTrans"
-        , "USING THE WINDOW`n- F1 hides or shows this window (and yes, you can rebind F1 itself)`n- Click a row to select it; Ctrl+click or Shift+click selects several rows`n- Double-click a row, or press Enter, to edit it; Del deletes the selected rows`n- Right-click a row to toggle, edit or delete that one binding`n- Ctrl+Z undoes the last change (10 levels deep)`n- The Filter box above each list narrows the rows as you type`n- Resize the window freely; the lists follow"))
-    App.Ui["GuideTxts"].Push(g.Add("Text", "xc+10 y+m w" gtW " h110 +BackgroundTrans"
-        , "SETTINGS AND FILES`n- The Settings tab holds the repeat options, the shell used by & commands, console visibility and the profile picker`n- theme.cfg can override the colors; Auto=1 follows the Windows dark/light mode automatically`n- Errors are written to error.log inside the ReBindX folder of the OS application-data directory (%APPDATA% on Windows; typically ~/.config/ReBindX on Linux/macOS)"))
-    App.Ui["GuideTxts"].Push(g.Add("Text", "xc+10 y+m w" gtW " h110 +BackgroundTrans"
-        , "TRIGGERS`n- Bindings can trigger on a hotkey (default), a HOTSTRING, or a PIXEL`n- Hotstring: type the trigger text anywhere, then an ending character (space, Enter...); replacement uses the action grammar: plain text, >Send syntax, macro:Name, run:/rw: commands`n- Pixel: fires when a screen pixel X,Y turns to / turns from a color; polls while ReBindX runs`n- The Hotstrings tab lists every hotstring binding; remaps are hotkey-only"))
-    App.Ui["GuideTxts"].Push(g.Add("Text", "xc+10 y+m w" gtW " h170 +BackgroundTrans"
-        , "FULL MULTI-CHARACTER KEY LIST`n" StrReplace(Keys.List, ",", ", ")))
+    App.Ui["GuideTxts"].Push(g.Add("Text", "xc+10 yc+10 w" gw " h" (tabH - 76) " +BackgroundTrans -Wrap", "COMMAND PREFIXES (Command Mapper actions)`n- &command  runs through the shell selected in Settings, hidden or visible per the console setting`n- Bash commands are syntax-checked (bash -n) before running`n- >text  sends text/keys instead of running a program`n- @code  runs AutoHotkey code via a temporary .ahk file (not available in compiled builds)`n- Doubled prefix (&&, >>, @@) passes the character through to the default handler`n- No prefix: hidden cmd.exe (Windows) / selected shell (Keysharp)`n`nSHELLS`n- The Settings tab selects the shell for & commands (cmd.exe or PowerShell on Windows; on Linux/macOS the list is discovered from the system)`n- bash is validated with bash -n before every run - syntax errors are reported and the command is NOT executed`n- rw: runs a command and WAITS for it to finish before the next macro action; run: proceeds immediately`n`nKEY REMAP REPEAT`n- !Tab 2 = press Tab twice with Alt held`n- Repeat-while-held: the Settings tab toggles whether holding the trigger key keeps repeating the output, with buffer/delay values (per-profile)"))
+    guide.UseTab(4)
+    App.Ui["GuideTxts"].Push(g.Add("Text", "xc+10 yc+10 w" gw " h" (tabH - 76) " +BackgroundTrans -Wrap", "MACROS`n- A macro is a reusable Send sequence stored in the macro library (Macros tab)`n- Bindings reference macros by name: a Key Remap output of macro:Name replays it`n- Editing a macro instantly updates every binding that uses it`n`nTHE BUILDER (Builder... button)`n- Build macros one action at a time: Key press (with hold duration), Key down, Key up, Wait (ms), Run command (with wait-until-return), Mouse move (X/Y, relative, hold a key while moving), Sequence (raw Send string)`n- Loop start / Loop end wrap a part of the sequence; loops need unique names`n- Endloop must match the innermost open loop, every loop must be closed before saving`n- Test run executes the current sequence once`n`nTRIGGER MODES (per macro)`n- On key press: fires when the assigned key goes down`n- On key release: fires when the assigned key goes up`n- Repeat while held: repeats with per-macro buffer/delay`n- Pixel watch: fires while the pixel at X,Y turns to / turns from a color; the watcher polls while ReBindX runs`n- Pixel capture may be unavailable on some compositors (watcher disables itself and logs once)`n`nMACRO GRAMMAR (stored per profile)`n- trg:press|release|repeat  trigger mode`n- rbuf:ms / rdel:ms  repeat buffer/delay`n- px:x,y,RRGGBB,to|from  pixel trigger`n- kd:Key / ku:Key / kp:Key[:holdMs]  key actions`n- w:ms  wait`n- run:cmd / rw:cmd  shell (async / wait)`n- mm:x,y,rel|abs[,hold:Key]  mouse move`n- loop:Name:Count ... endloop:Name  repetition`n- sq:string  raw Send sequence`n- A literal | inside a parameter is stored as {PIPE}"))
+    guide.UseTab(5)
+    App.Ui["GuideTxts"].Push(g.Add("Text", "xc+10 yc+10 w" gw " h" (tabH - 76) " +BackgroundTrans -Wrap", "HOTSTRINGS`n- A hotstring fires when you TYPE its trigger text anywhere, then an ending character (space, Enter, etc.)`n- Set the Trigger type to Hotstring in the binding editor and type the trigger text`n- Replacement actions follow the binding grammar: >text sends text/keys, no prefix runs a command, & runs via the selected shell, macro:Name replays a library macro`n- The Hotstrings tab lists every hotstring binding with New/Edit/Delete/Toggle`n- Scope works for hotstrings too: [wintitle] limits where the text triggers`n`nPIXEL TRIGGERS`n- Trigger type Pixel: the binding fires when the screen pixel at X,Y turns to (or turns from) a color RRGGBB`n- Polls continuously while ReBindX runs; fires once per transition and re-arms when the color clears`n- A pixel watcher disables itself (with one log entry) on platforms where pixel capture is unavailable`n`nHOTKEY TRIGGERS`n- The classic form: a hotkey (e.g. #^G) fires the action on key press`n- Multiple bindings may share a hotkey: the LATEST enabled binding wins`n- Per-app scoping via [wintitle]"))
+    guide.UseTab(6)
+    App.Ui["GuideTxts"].Push(g.Add("Text", "xc+10 yc+10 w" gw " h" (tabH - 76) " +BackgroundTrans -Wrap", "PROFILES`n- A profile bundles bindings, macros AND the three repeat settings`n- Active profile: pick from the dropdown and press Switch (or use the tray menu)`n- New profile...: create from current settings, clone an existing profile, or start empty`n- Save: writes the active profile (one-time warning before saving into Default)`n- Save As...: copy the active profile under a new name and switch to it`n- Rename: type a new name for the ACTIVE profile (disabled for Default)`n- Export... / Import...: single-profile config files, merge-on-import`n- Delete / Clear: removes a non-Default profile (Default is cleared instead)`n- Save to... (sidebar): copies the SELECTED bindings/macros/hotstrings into any profile without switching`n`nSTORAGE`n- Profiles live as [Profile:Name] sections in keybinds.cfg`n- The Default profile is the headerless section at the top`n- macro:Name and set:Key lines inside a section carry its macros and settings`n- Undo (Ctrl+Z) covers profile operations"))
+    guide.UseTab(7)
+    App.Ui["GuideTxts"].Push(g.Add("Text", "xc+10 yc+10 w" gw " h" (tabH - 76) " +BackgroundTrans -Wrap", "USING THE WINDOW`n- F1 hides/shows this window (rebindable)`n- Click a row to select; Ctrl+click or Shift+click selects several`n- Double-click a row, or press Enter, to edit; Del deletes the selected rows`n- Right-click a row to toggle/edit/delete that one binding`n- Ctrl+Z undoes the last change (10 levels)`n- The Filter box above each list narrows rows as you type`n- Resize the window freely; the lists follow (the Usage Guide content sets the lower limit)`n`nSETTINGS TAB`n- Repeat outputs/buffer/delay: per-profile remap repeat behavior`n- Run at startup: creates the Startup shortcut (Windows, admin)`n- Shell for & commands + console visibility`n`nFILES`n- keybinds.cfg: bindings, remaps, macros, profiles (UTF-8)`n- rebindxsettings.ini: settings (BOM-less UTF-8 in this port; the .ahk uses UTF-16)`n- theme.cfg: optional colors; Auto=1 follows Windows dark/light mode`n- errors: error.log inside the ReBindX folder of the OS application-data directory`n- icons\gear.ico / keyboard.ico: list icons (missing icons degrade silently)"))
     guide.UseTab()
     SetUIThemeFont(g, "s10 c" App.Theme["Text"])
 
@@ -2083,6 +2142,9 @@ BuildMainGui() {
     App.LV_Hotstrings.ModifyCol(2, lvW - 200 - 90 - 26)
     App.LV_Hotstrings.ModifyCol(3, 90)
     App.LV_Hotstrings.OnEvent("DoubleClick", HsDoubleClick)
+    App.Ui["EmptyHs"] := g.Add("Text", "xc" (10 + (inW - 220) // 2) " yc" (82 + (lvH // 2) - 11) " w220 h22 c" App.Theme["Hint"] " +BackgroundTrans Center"
+        , "No hotstrings yet - press New...")
+    App.Ui["EmptyHs"].Visible := false
 
     ; -- Tab 4: Macros (user request) - the global macro library --
     tabs.UseTab(4)
@@ -2104,6 +2166,9 @@ BuildMainGui() {
     App.LV_Macros.ModifyCol(2, 60)
     App.LV_Macros.ModifyCol(3, lvW - 170 - 60 - 26)
     App.LV_Macros.OnEvent("DoubleClick", MacroDoubleClick)
+    App.Ui["EmptyMac"] := g.Add("Text", "xc" (10 + (inW - 220) // 2) " yc" (82 + (lvH // 2) - 11) " w220 h22 c" App.Theme["Hint"] " +BackgroundTrans Center"
+        , "No macros yet - press Builder...")
+    App.Ui["EmptyMac"].Visible := false
     tabs.UseTab()
 
     ; ---- bottom status strip (UI 2) ----
@@ -2140,6 +2205,11 @@ GuiSize(g, minMax, w, h) {
     ; resizing (user report: shrinking cut the bottom off). Guard on
     ; the actual client size instead. Omitted x/y in Move() preserve
     ; the xc/yc container-relative anchors used by the .ks tab content.
+    ; ? explicit Move coordinates of tab children are ASSUMED to be
+    ;   container/page-relative under Keysharp (WinForms parent
+    ;   location) - the hint x values below use the page frame. If a
+    ;   resize ever shows them ~170px off-center, switch to the
+    ;   window frame (contentX + 10 + ...) - porting-notes round 112.
     if (!IsObject(App.MainGui) || g != App.MainGui)
         return
     if (w < 420 || h < 480)
@@ -2166,14 +2236,15 @@ GuiSize(g, minMax, w, h) {
         ; shrink gets clamped by its current content, so resizing
         ; the lists before the tab lets both shrink (user report:
         ; past a certain height the lists resized but the tab did not).
-        ; Omitted x in Move() preserves the .ks xc anchors; the
-        ; explicit y recenters the empty-state hints (user report).
+        ; Omitted x/y in the list Moves preserve the xc anchors; the
+        ; hint Moves pass explicit page-frame coordinates (see the
+        ; frame note at the top of this function).
         try {
             if App.Ui.Has("FilterCmd") {
                 App.Ui["FilterCmd"].Move(, , lvW - 60)
                 App.LV_Cmd.Move(, , lvW, lvH)
                 if App.Ui.Has("EmptyCmd")
-                    App.Ui["EmptyCmd"].Move(, contentY + lvY + (lvH // 2) - 11, 220, 22)
+                    App.Ui["EmptyCmd"].Move(10 + (lvW - 220) // 2, contentY + lvY + (lvH // 2) - 11, 220, 22)
             }
         } catch as ErrC {
             LogError("resize cmd list: " ErrC.Message)
@@ -2183,7 +2254,7 @@ GuiSize(g, minMax, w, h) {
                 App.Ui["FilterKey"].Move(, , lvW - 60)
                 App.LV_Key.Move(, , lvW, lvH)
                 if App.Ui.Has("EmptyKey")
-                    App.Ui["EmptyKey"].Move(, contentY + lvY + (lvH // 2) - 11, 220, 22)
+                    App.Ui["EmptyKey"].Move(10 + (lvW - 220) // 2, contentY + lvY + (lvH // 2) - 11, 220, 22)
             }
         } catch as ErrK {
             LogError("resize key list: " ErrK.Message)
@@ -2203,6 +2274,8 @@ GuiSize(g, minMax, w, h) {
             if IsObject(App.LV_Hotstrings) {
                 App.LV_Hotstrings.Move(, , lvW, lvH)
                 App.LV_Hotstrings.ModifyCol(2, lvW - 200 - 90 - 26)
+                if App.Ui.Has("EmptyHs")
+                    App.Ui["EmptyHs"].Move(10 + (lvW - 220) // 2, contentY + lvY + (lvH // 2) - 11, 220, 22)
             }
         } catch as ErrHs {
             LogError("resize hotstrings list: " ErrHs.Message)
@@ -2211,6 +2284,8 @@ GuiSize(g, minMax, w, h) {
             if IsObject(App.LV_Macros) {
                 App.LV_Macros.Move(, , lvW, lvH)
                 App.LV_Macros.ModifyCol(3, lvW - 170 - 60 - 26)
+                if App.Ui.Has("EmptyMac")
+                    App.Ui["EmptyMac"].Move(10 + (lvW - 220) // 2, contentY + lvY + (lvH // 2) - 11, 220, 22)
             }
         } catch as ErrM {
             LogError("resize macros list: " ErrM.Message)
@@ -2244,8 +2319,8 @@ InstallTips() {
     Tips.AddTip(App.Ui["FilterKey"], "Type to filter the remap list by key, output or window scope.")
 }
 
-; Single bulk refresh for both lists (BUG-01: callers never
-; refresh mid-batch; this is the only fill path).
+; * Single bulk refresh for every list surface (BUG-01: callers
+;   never refresh mid-batch; this is the only fill path).
 RefreshGuiData() {
     if !IsObject(App.MainGui)
         return
@@ -2355,16 +2430,21 @@ PopulateProfileDDL() {
 ; 9. GUI events
 ; =============================================================
 
+; Tab change: remember the active tab (Add-Binding prefill and the
+; Del/Enter scoping). A non-integer value can only mean a broken
+; toolkit - fall back to tab 1 instead of crashing.
 TabCh(ctrl, *) {
     v := ctrl.Value
     App.CTab := IsInteger(v) ? Integer(v) : 1
 }
 
+; Filter text change: remember the needle, then one bulk refresh.
 OnFilterCmdChange(ctrl, *) {
     App.Filter_Cmd := ctrl.Value
     RefreshGuiData()
 }
 
+; Filter text change: remember the needle, then one bulk refresh.
 OnFilterKeyChange(ctrl, *) {
     App.Filter_Key := ctrl.Value
     RefreshGuiData()
@@ -2385,10 +2465,10 @@ ToggleRepeat(*) {
 SyncEditSetting(settingKey, editName, minV, maxV) {
     if !App.Ui.Has(editName)
         return
-    text := Trim(App.Ui[editName].Value)
-    if !RegExMatch(text, "^\d+$")
-        return
-    v := Integer(text)
+    ; the NumericUpDown Value may arrive as an Integer, a plain
+    ; string or decimal text like "250.0" - parse defensively
+    ; (garbage reads as below-range, then clamps to min)
+    v := SafeInt(App.Ui[editName].Value, minV - 1)
     if (v < minV)
         v := minV
     if (v > maxV)
@@ -2411,9 +2491,9 @@ ToggleStartup(*) {
     ; Keysharp divergence (final review F3): off-Windows there is no
     ; A_Startup shortcut convention and Keysharp's FileCreateShortcut
     ; writes .desktop/symlink launchers whose generated name never
-    ; matches the .lnk probe, so the toggle would dead-end behind
-    ; an A_IsAdmin dialog. XDG autostart support is the follow-up
-    ; (see Resources/keysharp_porting_notes.md); report honestly.
+    ;   matches the .lnk probe, so the toggle would dead-end behind
+    ;   an A_IsAdmin dialog.
+    ; todo: XDG autostart (~/.config/autostart .desktop entry) off-Windows
     SetStatus("Run at startup is Windows-only in this port")
     return
 #else
@@ -2438,6 +2518,8 @@ ToggleStartup(*) {
 #endif
 }
 
+; Shell DDL change: persist the selected shell Id. The index is
+; bounds-checked - never trust a toolkit-provided index.
 OnShellDDLChange(ctrl, *) {
     idx := ctrl.Value
     if (idx >= 1 && idx <= App.Shells.Length)
@@ -2445,6 +2527,7 @@ OnShellDDLChange(ctrl, *) {
     SetStatus("Shell for & commands: " ctrl.Text)
 }
 
+; Console visibility flip for & commands (Hidden/Visible face).
 ToggleShellVis(*) {
     App.Settings["ShellHidden"] := App.Settings["ShellHidden"] ? 0 : 1
     if App.Ui.Has("ShellVisBtn")
@@ -2452,6 +2535,7 @@ ToggleShellVis(*) {
     SetStatus("& commands will run " (App.Settings["ShellHidden"] ? "hidden" : "visible"))
 }
 
+; Profiles tab Switch button: apply the DDL selection ("" = no-op).
 OnProfileSwitchBtn(*) {
     if !App.Ui.Has("ProfileDDL")
         return
@@ -2684,9 +2768,9 @@ OpenEditor(mode := "Add", id := "", prefill := 0) {
         if prefill.Has("Trig")
             st["Trig"] := prefill["Trig"]
     }
-    ; NOTE: st stays LOCAL to this dialog. The save handler receives
-    ; it via Bind() so two simultaneously open editors cannot
-    ; cross-contaminate their Mode/OrigId (review finding 4).
+    ; * st stays LOCAL to this dialog. The save handler receives it
+    ;   via Bind() so two simultaneously open editors cannot
+    ;   cross-contaminate their Mode/OrigId (review finding 4).
 
     ed := Gui("-MaximizeBox +OwnDialogs", App.Name " - Binding Editor")
     ed.BackColor := App.Theme["Background"]
@@ -2812,6 +2896,7 @@ EditorTypeChange(ctrl, *) {
     }
 }
 
+; Category DDL change: refill the key DDL and re-compose the keybind.
 EditorCatChange(ctrl, *) {
     PopulateKeyPick(ctrl.Gui, ctrl.Text)
     PickerChange(ctrl)
@@ -2949,8 +3034,10 @@ TestRemap(ctrl, *) {
         }
     } else if (trig = "Hotstring") {
         hsTxt := RegExReplace(Trim(g["KeyEdit"].Value), "i)^hs:")
-        if (hsTxt = "" || InStr(hsTxt, ";") || InStr(hsTxt, "|")) {
-            MsgBox("Hotstring text cannot be empty or contain AutoHotkey escape characters.", "Error", "Icon!")
+        ; ; and | cannot survive the cfg grammar, [ and ] would be
+        ; parsed back as a window scope on reload - reject all five
+        if (hsTxt = "" || InStr(hsTxt, ";") || InStr(hsTxt, "|") || InStr(hsTxt, "[") || InStr(hsTxt, "]")) {
+            MsgBox("Hotstring text cannot be empty or contain special characters", "Error", "Icon!")
             return
         }
         key := "hs:" hsTxt
@@ -2961,15 +3048,15 @@ TestRemap(ctrl, *) {
         pxM := (g["PM"].Value = 2) ? "from" : "to"
         pxOk := true
         try {
-            Integer(pxX)
-            Integer(pxY)
+            if (Integer(pxX) < 0 || Integer(pxY) < 0)
+                pxOk := false   ; negative coordinates are off-screen
         } catch as ErrP {
             pxOk := false
         }
         if (pxOk && !RegExMatch(pxC, "^[0-9A-F]{6}$"))
             pxOk := false
         if !pxOk {
-            MsgBox("Pixel trigger needs integer X/Y and a 6-digit hex color.", "Error", "Icon!")
+            MsgBox("Pixel trigger needs non-negative integer X/Y and a 6-digit hex color.", "Error", "Icon!")
             return
         }
         key := "px:" Integer(pxX) "," Integer(pxY) "," pxC "," pxM
@@ -3018,8 +3105,10 @@ EditorSave(st, ctrl, *) {
         }
     } else if (trig = "Hotstring") {
         hsTxt := RegExReplace(Trim(g["KeyEdit"].Value), "i)^hs:")
-        if (hsTxt = "" || InStr(hsTxt, ";") || InStr(hsTxt, "|")) {
-            MsgBox("Hotstring text cannot be empty or contain AutoHotkey escape characters", "Error", "Icon!")
+        ; ; and | cannot survive the cfg grammar, [ and ] would be
+        ; parsed back as a window scope on reload - reject all five
+        if (hsTxt = "" || InStr(hsTxt, ";") || InStr(hsTxt, "|") || InStr(hsTxt, "[") || InStr(hsTxt, "]")) {
+            MsgBox("Hotstring text cannot be empty or contain special characters", "Error", "Icon!")
             return
         }
         key := "hs:" hsTxt
@@ -3030,15 +3119,15 @@ EditorSave(st, ctrl, *) {
         pxM := (g["PM"].Value = 2) ? "from" : "to"
         pxOk := true
         try {
-            Integer(pxX)
-            Integer(pxY)
+            if (Integer(pxX) < 0 || Integer(pxY) < 0)
+                pxOk := false   ; negative coordinates are off-screen
         } catch as ErrP {
             pxOk := false
         }
         if (pxOk && !RegExMatch(pxC, "^[0-9A-F]{6}$"))
             pxOk := false
         if !pxOk {
-            MsgBox("Pixel trigger needs integer X/Y and a 6-digit hex color.", "Error", "Icon!")
+            MsgBox("Pixel trigger needs non-negative integer X/Y and a 6-digit hex color.", "Error", "Icon!")
             return
         }
         key := "px:" Integer(pxX) "," Integer(pxY) "," pxC "," pxM
@@ -3055,9 +3144,9 @@ EditorSave(st, ctrl, *) {
         action := NormalizeAction(action)
     }
     scope := Trim(g["ScopeEdit"].Value)
-    ; Scope chars that cannot round-trip through keybinds.cfg would
-    ; silently drop the binding on the next load - reject at edit
-    ; time instead (security review F6).
+    ; ! Scope chars that cannot round-trip through keybinds.cfg would
+    ;   silently drop the binding on the next load - rejected at edit
+    ;   time instead (security review F6).
     if RegExMatch(scope, "[\[\];]") {
         MsgBox("Window scope cannot contain '[', ']' or ';'.`n`nThose characters cannot be stored in keybinds.cfg.", "Error", "Icon!")
         return
@@ -3094,9 +3183,11 @@ EditorSave(st, ctrl, *) {
 }
 
 ; =============================================================
-; 9c. Macros tab (user request): the global macro library.
-; Macros are Send-syntax sequences stored in the [Macros] section
-; of keybinds.cfg and referenced by key bindings as macro:Name.
+; 9c. Macros tab (user request): the macro library.
+; Macros are Send-syntax sequences stored PER PROFILE (macro: lines
+; inside the profile sections of keybinds.cfg) and referenced by key
+; bindings as macro:Name. A legacy [Macros] section is still READ
+; into Default on load, but never written back.
 ; =============================================================
 
 ; Name of the selected macro row ("" when none).
@@ -3109,14 +3200,21 @@ MacroSelectedName() {
     return name
 }
 
+; Fill the macro library list: name, character count, 60-char preview.
 FillMacroList() {
     if !IsObject(App.LV_Macros)
         return
     App.LV_Macros.Opt("-Redraw")
     App.LV_Macros.Delete()
-    for name, seq in App.MacroLib
+    shownMac := 0
+    for name, seq in App.MacroLib {
         App.LV_Macros.Add("", name, StrLen(seq), SubStr(seq, 1, 60))
+        shownMac++
+    }
     App.LV_Macros.Opt("+Redraw")
+    ; empty state: centered overlay hint (mirrors the binding lists)
+    if App.Ui.Has("EmptyMac")
+        App.Ui["EmptyMac"].Visible := (shownMac = 0)
 }
 
 MacroEditSelected(*) {
@@ -3170,6 +3268,10 @@ MacroRunSelected(*) {
         SetStatus("Select a macro first")
         return
     }
+    if !App.MacroLib.Has(name) {
+        SetStatus("Macro not found: " name)
+        return
+    }
     seq := App.MacroLib[name]
     try {
         if IsStructuredMacro(seq)
@@ -3219,12 +3321,18 @@ MacroSave(mode, origName, ctrl, *) {
     g := ctrl.Gui
     mname := Trim(g["MName"].Value)
     seq := Trim(g["MSeq"].Value)
-    if (mname = "" || InStr(mname, ";") || InStr(mname, "[") || InStr(mname, "]") || InStr(mname, "*")) {
+    if (mname = "" || InStr(mname, ";") || InStr(mname, "[") || InStr(mname, "]") || InStr(mname, "*") || InStr(mname, "|")) {
         MsgBox("Macro name cannot be empty or contain special characters", "Error", "Icon!")
         return
     }
     if (seq = "") {
         MsgBox("Sequence cannot be empty.", "Error", "Icon!")
+        return
+    }
+    ; ! line breaks cannot round-trip through keybinds.cfg (one line
+    ;   = one entry) - point at {Enter} instead of corrupting the file
+    if (InStr(seq, "`n") || InStr(seq, "`r")) {
+        MsgBox("The sequence cannot contain line breaks.`nUse {Enter} where a newline should be sent.", "Error", "Icon!")
         return
     }
     ; overwrite / rename-target prompt (mode and origName arrive bound)
@@ -3246,7 +3354,7 @@ MacroSave(mode, origName, ctrl, *) {
 ; 9d. Structured macro engine + Macro Builder (user request)
 ;
 ; A STRUCTURED macro is a "|"-separated token sequence stored in the
-; [Macros] section like any other macro:
+; active profile's macro library like any other macro:
 ;   trg:press|release|repeat  - trigger mode (default press)
 ;   rbuf:ms / rdel:ms         - repeat-mode buffer/delay
 ;   px:x,y,RRGGBB,to|from     - PIXEL trigger (watcher fires it)
@@ -3264,17 +3372,27 @@ IsStructuredMacro(s) {
     return InStr(s, "|") && RegExMatch(s, "i)^[a-z]+:")
 }
 
-; Header tokens (trg:/rbuf:/rdel:) -> {Mode, Buf, Del}
+; Header tokens (trg:/rbuf:/rdel:) -> {Mode, Buf, Del}.
+; ! NEVER throws: a hand-edited cfg can carry "rbuf:abcd" / "rdel:-13"
+;   / an unknown mode - bad numbers read as 0, negatives clamp to 0,
+;   unknown modes fall back to "press" (this also runs inside hotkey
+;   registration: WantsKeyUpVariant -> EnsureUpVariant).
 ParseMacroHeader(seq) {
     mode := "press", rbuf := 0, rdel := 0
     for , tok in StrSplit(seq, "|") {
-        if (SubStr(tok, 1, 4) = "trg:")
-            mode := StrLower(SubStr(tok, 5))
-        else if (SubStr(tok, 1, 5) = "rbuf:")
-            rbuf := Integer(SubStr(tok, 6))
+        if (SubStr(tok, 1, 4) = "trg:") {
+            m := StrLower(SubStr(tok, 5))
+            if (m = "release" || m = "repeat" || m = "pixel")
+                mode := m
+        } else if (SubStr(tok, 1, 5) = "rbuf:")
+            rbuf := SafeInt(SubStr(tok, 6), 0)
         else if (SubStr(tok, 1, 5) = "rdel:")
-            rdel := Integer(SubStr(tok, 6))
+            rdel := SafeInt(SubStr(tok, 6), 0)
     }
+    if (rbuf < 0)
+        rbuf := 0
+    if (rdel < 0)
+        rdel := 0
     return {Mode: mode, Buf: rbuf, Del: rdel}
 }
 
@@ -3325,6 +3443,8 @@ RunMacroSequence(seq) {
             SetStatus("Macro action failed - see error log")
         }
         actions++
+        ; * runaway-loop safety valve: a hand-edited loop count can
+        ;   never hang the script
         if (actions > 100000) {
             LogError("macro aborted after 100000 actions (runaway loop?)")
             SetStatus("Macro aborted - see error log")
@@ -3364,7 +3484,10 @@ ExecuteMacroToken(tok) {
         case "ku":
             Send("{" arg " up}")
         case "w":
-            Sleep(Integer(arg))
+            ms := SafeInt(arg, 0)   ; hand-edited token: "abcd" waits 0
+            if (ms < 0)
+                ms := 0
+            Sleep(ms)
         case "run":
             RunViaShell(GetShellById(App.Settings["ShellCmd"]), arg, "Hide")
         case "rw":
@@ -3476,6 +3599,7 @@ RebuildPixelWatchers() {
         coordDone := true
         try CoordMode("Pixel", "Screen")
     }
+    prev := App.PixelWatchers   ; fire/dead state carried across the rebuild
     App.PixelWatchers := []
     for name, seq in App.MacroLib {
         for , tok in StrSplit(seq, "|") {
@@ -3508,6 +3632,19 @@ RebuildPixelWatchers() {
             LogError("pixel binding trigger: " Err.Message)
         }
     }
+    ; * carry the fire/dead state of identical watchers: a plain UI
+    ;   refresh (filter typing, toggles) must not re-trigger a watcher
+    ;   that already fired - "fires once per transition" must hold
+    for , nw in App.PixelWatchers {
+        for , ow in prev {
+            if (nw.Kind = ow.Kind && nw.Name = ow.Name && nw.X = ow.X && nw.Y = ow.Y
+                    && nw.Color = ow.Color && nw.Mode = ow.Mode) {
+                nw.Fired := ow.Fired
+                nw.Dead := ow.Dead
+                break
+            }
+        }
+    }
     if (App.PixelWatchers.Length > 0)
         SetTimer(PixelWatchTick, -200)
 }
@@ -3515,6 +3652,8 @@ RebuildPixelWatchers() {
 ; Poll every live watcher; fire its macro on the color transition.
 ; A watcher whose PixelGetColor fails (e.g. unsupported platform)
 ; disables itself after logging once.
+; ? pixel capture is unavailable on some Wayland compositors - the
+;   self-disable is the documented degradation, not an error
 PixelWatchTick() {
     live := 0
     for , w in App.PixelWatchers {
@@ -3542,10 +3681,12 @@ PixelWatchTick() {
         SetTimer(PixelWatchTick, -200)
 }
 
-; ---- Macro Builder GUI (cached windows: built once, hidden on close) ----
+; ---- Macro Builder GUI (single-instance, destroy-on-close, ----
+;      rebuilt on demand) ----
 
-; Hide (do not destroy) the builder; also hide its action dialog so
-; no orphaned child window survives (user report).
+; Close the builder: destroy it AND its action dialog so no orphaned
+; child window survives (user report); App.BuilderGui is cleared so
+; the next open rebuilds fresh.
 BuilderWinClose(bd, *) {
     CloseActionDialog()
     try bd.Destroy()
@@ -3578,6 +3719,11 @@ FillBuilderList() {
         lv.Add("", i, d[1], d[2], d[3])
     }
     lv.Opt("+Redraw")
+    ; empty state: centered overlay hint (mirrors the main lists)
+    try App.BuilderGui["EmptyBld"].Visible := (App.BuilderRows.Length = 0)
+    catch as Err {
+        LogError("builder empty hint: " Err.Message)
+    }
 }
 
 ; Token -> [Action, Value, Detail] display columns.
@@ -3599,13 +3745,15 @@ TokenDisplay(tok) {
         case "rw": return ["Run command", SubStr(arg, 1, 50), "waits for return"]
         case "mm":
             p := StrSplit(StrReplace(SubStr(tok, 4), "{PIPE}", "|"), ",")
+            if (p.Length < 2)   ; hand-edited "mm:5" must not crash the list
+                return ["Mouse move", "(malformed)", ""]
             d := (p.Length >= 3 && StrLower(p[3]) = "rel") ? "relative" : "absolute"
             if (p.Length >= 4 && SubStr(p[4], 1, 5) = "hold:")
                 d .= ", holding " SubStr(p[4], 6)
             return ["Mouse move", p[1] "," p[2], d]
         case "loop":
             nm := (parts.Length >= 3) ? parts[2] : ""
-            cnt := (parts.Length >= 3) ? parts[3] : parts[2]
+            cnt := (parts.Length >= 3) ? parts[3] : (parts.Length >= 2 ? parts[2] : "?")
             return ["Loop start", nm, cnt " times"]
         case "endloop":
             nm := (parts.Length >= 2) ? parts[2] : ""
@@ -3625,7 +3773,7 @@ MacroNewStructured(*) {
     OpenMacroBuilder("", "")
 }
 
-; Open the (single-instance, cached) builder. seq = "" starts empty.
+; Open the single-instance builder (rebuilt after a close). seq = "" starts empty.
 OpenMacroBuilder(name, seq) {
     if !IsObject(App.BuilderGui)
         BuildBuilderWindow()
@@ -3683,7 +3831,7 @@ OpenMacroBuilder(name, seq) {
     bd.Show("w820 h536")
 }
 
-; Build the builder window exactly once.
+; Build the builder window (once per open; BuilderWinClose destroys it).
 BuildBuilderWindow() {
     bd := Gui("-MaximizeBox +OwnDialogs", App.Name " - Macro Builder")
     App.BuilderGui := bd
@@ -3710,8 +3858,12 @@ BuildBuilderWindow() {
     lvb.ModifyCol(1, 44)
     lvb.ModifyCol(2, 120)
     lvb.ModifyCol(3, 300)
-    lvb.ModifyCol(4, 708 - 44 - 120 - 300 - 8)
+    lvb.ModifyCol(4, 788 - 44 - 120 - 300 - 8)
     lvb.OnEvent("DoubleClick", BuilderRowDouble)
+    ; empty-state hint, centered over the action list (16+(788-220)/2, 164+278/2-11)
+    bd.Add("Text", "x" (16 + (788 - 220) // 2) " y" (164 + (278 // 2) - 11) " w220 h22 vEmptyBld c" App.Theme["Hint"] " +BackgroundTrans Center"
+        , "No actions yet - press Add action...")
+    bd["EmptyBld"].Visible := false
     addBtn := bd.Add("Button", "x16 y502 w110 h28 vBAdd" BtnBg(), "Add action...")
     addBtn.OnEvent("Click", (*) => OpenActionDialog(0))
     editBtn := bd.Add("Button", "x136 y502 w110 h28 vBEdit" BtnBg(), "Edit action...")
@@ -3749,7 +3901,9 @@ BuilderSize(bd, minMax, w, h) {
     if (w < 340 || h < 250)
         return
     try {
-        bd["BLV"].Move(, , w - 32, h - 28 - 6 - 164 - 20)
+        lvH2 := h - 28 - 6 - 164 - 20
+        bd["BLV"].Move(, , w - 32, lvH2)
+        bd["EmptyBld"].Move(16 + ((w - 32) - 220) // 2, 164 + (lvH2 // 2) - 11, 220, 22)
     } catch as ErrL {
         LogError("builder list resize: " ErrL.Message)
     }
@@ -3762,6 +3916,7 @@ BuilderSize(bd, minMax, w, h) {
     }
 }
 
+; Double-click an action row = edit it in the action dialog.
 BuilderRowDouble(ctrl, info, *) {
     if (info = 0)
         return
@@ -3821,18 +3976,18 @@ BuilderSave(*) {
     if !IsObject(g)
         return
     mname := Trim(g["BName"].Value)
-    if (mname = "" || InStr(mname, ";") || InStr(mname, "[") || InStr(mname, "]") || InStr(mname, "*")) {
+    if (mname = "" || InStr(mname, ";") || InStr(mname, "[") || InStr(mname, "]") || InStr(mname, "*") || InStr(mname, "|")) {
         MsgBox("Macro name cannot be empty or contain special characters", "Error", "Icon!")
         return
     }
-    ; Loop validation (rewritten, backward-scan matching; unit-tested):
-    ; each endloop claims the NEAREST unmatched loop start before it.
-    ; Names must match when both carry one; anonymous ends match any.
+    ; * Loop validation (rewritten, backward-scan matching; unit-tested):
+    ;   each endloop claims the NEAREST unmatched loop start before it.
+    ;   Names must match when both carry one; anonymous ends match any.
     rowsTxt := ""
     for i, r in App.BuilderRows
         rowsTxt .= i ": " r.Tok "`n"
-    ; NOTE: Array.Has() returns blank in this Keysharp build (proven
-    ; empirically in the harness) - the matched set MUST be a Map.
+    ; ! Array.Has() returns BLANK in this Keysharp build (proven in
+    ;   the harness) - the matched set MUST be a Map, never an Array.
     matched := Map()
     for i, r in App.BuilderRows {
         tok := r.Tok
@@ -3876,7 +4031,15 @@ BuilderSave(*) {
     if (trigIdx = 2) {
         hdrToks := "trg:release|"
     } else if (trigIdx = 3) {
-        hdrToks := "trg:repeat|rbuf:" Trim(g["BBuf"].Value) "|rdel:" Trim(g["BDel"].Value) "|"
+        ; buffer/delay are free-typed: require clean non-negative
+        ; integers so the stored header always parses (ParseMacroHeader)
+        bufV := SafeInt(Trim(g["BBuf"].Value), -1)
+        delV := SafeInt(Trim(g["BDel"].Value), -1)
+        if (bufV < 0 || delV < 0) {
+            MsgBox("Repeat buffer and delay must be integers >= 0.", "Error", "Icon!")
+            return
+        }
+        hdrToks := "trg:repeat|rbuf:" bufV "|rdel:" delV "|"
     } else if (trigIdx = 4) {
         px := Trim(g["BPX"].Value)
         py := Trim(g["BPY"].Value)
@@ -3884,12 +4047,10 @@ BuilderSave(*) {
         pm := (g["BPMode"].Value = 2) ? "from" : "to"
         okXY := false
         try {
-            Integer(px)
-            Integer(py)
-            okXY := true
+            okXY := (Integer(px) >= 0 && Integer(py) >= 0)   ; negatives are off-screen
         }
         if (!okXY || !RegExMatch(pc, "^[0-9A-F]{6}$")) {
-            MsgBox("Pixel trigger needs integer X, Y and a 6-digit hex color (RRGGBB).", "Error", "Icon!")
+            MsgBox("Pixel trigger needs non-negative integer X, Y and a 6-digit hex color (RRGGBB).", "Error", "Icon!")
             return
         }
         hdrToks := "trg:pixel|px:" px "," py "," pc "," pm "|"
@@ -3907,7 +4068,7 @@ BuilderSave(*) {
     SetStatus("Macro '" mname "' saved (builder)")
 }
 
-; ---- action dialog (cached; fields shown per selected type) ----
+; ---- action dialog (rebuilt on demand; fields shown per type) ----
 
 ; Open for append (rowIndex = 0) or edit (rowIndex > 0).
 OpenActionDialog(rowIndex) {
@@ -3957,7 +4118,16 @@ OpenActionDialog(rowIndex) {
         g["AType"].Choose(1)
         ActionDlgTypeChange(g["AType"])
     } else {
-        PrefillActionDialog(g, App.BuilderRows[rowIndex].Tok)
+        ; a stale row number (list shrank since the click) must not crash
+        if (rowIndex < 1 || rowIndex > App.BuilderRows.Length) {
+            SetStatus("Action row not found")
+            return
+        }
+        try PrefillActionDialog(g, App.BuilderRows[rowIndex].Tok)
+        catch as Err {
+            LogError("action prefill: " Err.Message)
+            SetStatus("Action could not be loaded - see error log")
+        }
     }
     g.Show()
 }
@@ -4092,7 +4262,7 @@ PrefillActionDialog(g, tok) {
             g["ALoopCount"].Value := parts[3]
         } else {
             g["ALoopName"].Value := ""
-            g["ALoopCount"].Value := parts[2]
+            g["ALoopCount"].Value := (parts.Length >= 2) ? parts[2] : ""   ; bare "loop"
         }
     } else if (op = "endloop") {
         which := 9
@@ -4272,12 +4442,17 @@ FillHotstringList() {
         return
     App.LV_Hotstrings.Opt("-Redraw")
     App.LV_Hotstrings.Delete()
+    shownHs := 0
     for , b in ActiveProfileMap() {
         if (SubStr(b["Key"], 1, 3) != "hs:")
             continue
         App.LV_Hotstrings.Add("", SubStr(b["Key"], 4), b["Action"], b["Enabled"] ? "Enabled" : "Disabled")
+        shownHs++
     }
     App.LV_Hotstrings.Opt("+Redraw")
+    ; empty state: centered overlay hint (mirrors the binding lists)
+    if App.Ui.Has("EmptyHs")
+        App.Ui["EmptyHs"].Visible := (shownHs = 0)
 }
 
 ; Binding id for a Hotstrings-tab row (match on the trigger text).
@@ -4287,13 +4462,21 @@ HsRowId(row) {
     if (trig = "")
         return ""
     want := "hs:" trig
+    ; prefer the UNSCOPED binding: several rows can share one trigger
+    ; text (different scopes, indistinguishable in this list)
+    fallbackId := ""
     for id, b in ActiveProfileMap() {
-        if (b["Key"] = want)
-            return id
+        if (b["Key"] = want) {
+            if (b["Scope"] = "")
+                return id
+            if (fallbackId = "")
+                fallbackId := id
+        }
     }
-    return ""
+    return fallbackId
 }
 
+; New hotstring: binding editor prefilled with the Hotstring trigger.
 HsNew(*) {
     pre := Map("Type", "cmd", "Trig", "hs")
     OpenEditor("Add", "", pre)
@@ -4308,6 +4491,8 @@ HsEditSelected(*) {
     id := HsRowId(row)
     if (id != "")
         OpenEditor("Edit", id)
+    else
+        SetStatus("Hotstring not found")
 }
 
 HsDoubleClick(ctrl, info, *) {
@@ -4354,10 +4539,10 @@ HsToggleSelected(*) {
 }
 
 ; ---- Profile management (user request) ----
-; Macros and the three repeat settings are PER-PROFILE now: the
-; active profile's macro map is the App.MacroLib VIEW, and the
-; repeat settings sync between App.Settings and the profile store
-; at save time. Written as macro:/set: lines inside each section.
+; * Macros and the three repeat settings are PER-PROFILE now: the
+;   active profile's macro map is the App.MacroLib VIEW, and the
+;   repeat settings sync between App.Settings and the profile store
+;   at save time. Written as macro:/set: lines inside each section.
 
 ; Point App.MacroLib and the repeat settings at a profile.
 SetProfileView(name) {
@@ -4368,9 +4553,22 @@ SetProfileView(name) {
     App.MacroLib := App.ProfileMacros[name]
     ps := App.ProfileSettings[name]
     for , k in ["DoRepeatOutputs", "RepeatBuffer", "RepeatDelay"] {
-        if ps.Has(k)
-            App.Settings[k] := ps[k]
-        else
+        if ps.Has(k) {
+            ; ! hand-edited set: lines can carry anything ("abcd", "-13");
+            ;   sanitize before the values reach Sleep()/the UpDowns
+            v := SafeInt(ps[k], -1)
+            if (k = "DoRepeatOutputs")
+                App.Settings[k] := (v = 1) ? 1 : 0
+            else {
+                if (v < 0)
+                    v := 0
+                if (v > 1000)
+                    v := 1000
+                if (k = "RepeatDelay" && v > 500)
+                    v := 500
+                App.Settings[k] := v
+            }
+        } else
             ps[k] := App.Settings[k]
     }
 }
@@ -4381,10 +4579,12 @@ FillProfilesTab() {
         return
     try {
         App.Ui["ProfNameEdit"].Value := App.ActiveProfile
-        App.Ui["PDeleteBtn"].Text := (App.ActiveProfile = "Default") ? "Clear profile" : "Delete profile"
+        if App.Ui.Has("PDeleteBtn")
+            App.Ui["PDeleteBtn"].Text := (App.ActiveProfile = "Default") ? "Clear profile" : "Delete profile"
         ; renaming Default is not allowed - disable the controls
         isDef := (App.ActiveProfile = "Default")
-        App.Ui["PRenameBtn"].Enabled := !isDef
+        if App.Ui.Has("PRenameBtn")
+            App.Ui["PRenameBtn"].Enabled := !isDef
         App.Ui["ProfNameEdit"].Enabled := !isDef
         if App.Ui.Has("ProfHint")
             App.Ui["ProfHint"].Text := isDef ? "Renaming is disabled for the Default profile." : "Rename target: type the new name for the ACTIVE profile, then press Rename."
@@ -4423,11 +4623,17 @@ ProfileNewDialog(*) {
     pd.Add("Text", "x16 y172 w340 h20 vCloneLbl", "(select the profile to copy)")
     cloneDDL.Visible := false
     pd["CloneLbl"].Visible := false
+    cloneCount := 0
     for , pn in ProfileNamesSorted() {
-        if (pn != "Default")
+        if (pn != "Default") {
             cloneDDL.Add(pn)
+            cloneCount++
+        }
     }
-    cloneDDL.Choose(1)
+    ; ! Choose(1) on an EMPTY list throws on both engines - the first
+    ;   run (only the Default profile exists) must not crash the dialog
+    if (cloneCount > 0)
+        cloneDDL.Choose(1)
     okBtn := pd.Add("Button", "x96 y206 w100 h30" BtnBg(), "Create")
     okBtn.OnEvent("Click", ProfileNewCreate.Bind(pd))
     caBtn := pd.Add("Button", "x206 y206 w100 h30" BtnBg(), "Cancel")
@@ -4435,6 +4641,7 @@ ProfileNewDialog(*) {
     pd.Show("w390 h250")
 }
 
+; Mode DDL: the clone selector is visible only in "Clone" mode (2).
 NewDlgModeChange(ctrl, *) {
     g := ctrl.Gui
     show := (ctrl.Value = 2)
@@ -4521,7 +4728,7 @@ ProfileSaveAs(*) {
 
 ProfileNameOk(name) {
     if (name = "" || InStr(name, ";") || InStr(name, "[") || InStr(name, "]") || InStr(name, "*") || InStr(name, "|")) {
-        MsgBox("Profile name cannot be empty or contain ; [ ] * |", "Error", "Icon!")
+        MsgBox("Profile name cannot be empty or contain special characters", "Error", "Icon!")
         return false
     }
     return true
@@ -4554,7 +4761,7 @@ ProfileRename(*) {
         App.ProfileSettings.Delete(oldName)
     App.ActiveProfile := newName
     App.Settings["ActiveProfile"] := newName
-    App.Settings["WarnedDefaultOverride"] := App.Settings["WarnedDefaultOverride"]
+    ; // the old no-op self-assignment of WarnedDefaultOverride removed
     RebuildProfilesMenu()
     RefreshGuiData()
     SetDirty()
@@ -4562,6 +4769,8 @@ ProfileRename(*) {
 }
 
 ProfileExport(*) {
+    ; ? the hard-coded "\" breaks the default path under Unix (JoinPath
+    ;   is not used here) - flagged in the round-113 report, fix pending
     file := FileSelect("S24", A_ScriptDir "\profile.cfg", "Export profile", "Config Files (*.cfg)")
     if (file = "")
         return
@@ -4592,10 +4801,28 @@ ProfileImport(*) {
     PushUndo()
     added := 0
     try {
+        ; entries before any [Profile:] header land in Default (a
+        ; headerless keybinds.cfg-style file still imports)
+        if !App.Profiles.Has("Default")
+            App.Profiles["Default"] := Map()
+        if !App.ProfileMacros.Has("Default")
+            App.ProfileMacros["Default"] := Map()
+        if !App.ProfileSettings.Has("Default")
+            App.ProfileSettings["Default"] := Map()
+        curP := App.Profiles["Default"]
+        curM := App.ProfileMacros["Default"]
+        curS := App.ProfileSettings["Default"]
+        section := "cmd"
         for , raw in StrSplit(FileRead(file, "UTF-8"), "`n", "`r") {
             line := Trim(raw)
-            if (line = "" || SubStr(line, 1, 1) = ";" || RegExMatch(line, "^-{3,}$"))
+            if (line = "" || SubStr(line, 1, 1) = ";")
                 continue
+            ; the --- separator switches command -> remap entries, so
+            ; remaps from a profile export keep their binding type
+            if RegExMatch(line, "^-{3,}$") {
+                section := "key"
+                continue
+            }
             if (SubStr(line, 1, 9) = "[Profile:") {
                 pname := Trim(SubStr(line, 10, StrLen(line) - 10))
                 if (pname = "")
@@ -4608,6 +4835,7 @@ ProfileImport(*) {
                 curP := App.Profiles[pname]
                 curM := App.ProfileMacros[pname]
                 curS := App.ProfileSettings[pname]
+                section := "cmd"
                 continue
             }
             parts := StrSplit(line, ";", , 2)
@@ -4615,10 +4843,10 @@ ProfileImport(*) {
                 continue
             keypart := Trim(parts[1])
             payload := StrReplace(Trim(parts[2]), "{SEMICOLON}", ";")
-            if (SubStr(keypart, 1, 6) = "macro:") {
+            if (SubStr(keypart, 1, 6) = "macro:" && SubStr(keypart, 7) != "") {
                 curM[SubStr(keypart, 7)] := payload
                 added++
-            } else if (SubStr(keypart, 1, 4) = "set:") {
+            } else if (SubStr(keypart, 1, 4) = "set:" && SubStr(keypart, 5) != "") {
                 curS[SubStr(keypart, 5)] := payload
                 added++
             } else {
@@ -4632,6 +4860,7 @@ ProfileImport(*) {
                     keypart := Trim(m[1])
                     scope := m[2]
                 }
+                type := (section = "key") ? "key" : "cmd"
                 id := ""
                 if (SubStr(keypart, 1, 3) = "hs:" || SubStr(keypart, 1, 3) = "px:") {
                     id := "cmd|" keypart "|" scope
@@ -4639,13 +4868,15 @@ ProfileImport(*) {
                     nk := NormalizeKey(keypart)
                     if (nk = "")
                         continue
-                    id := "cmd|" nk "|" scope
+                    id := type "|" nk "|" scope
                 }
-                type := "cmd"
-                curP[id] := Map("Type", type, "Key", SubStr(id, InStr(id, "|") + 1, InStr(id, "|", false, InStr(id, "|") + 1) - InStr(id, "|") - 1), "Scope", scope, "Action", payload, "Enabled", enabled, "Seq", ++App.Seq)
+                act := (type = "key") ? NormalizeAction(payload) : payload
+                curP[id] := Map("Type", type, "Key", SubStr(id, InStr(id, "|") + 1, InStr(id, "|", false, InStr(id, "|") + 1) - InStr(id, "|") - 1), "Scope", scope, "Action", act, "Enabled", enabled, "Seq", ++App.Seq)
                 added++
             }
         }
+        UnregisterAllHotkeys()   ; imported enabled bindings must activate
+        RegisterAllHotkeys()
         RebuildProfilesMenu()
         RefreshGuiData()
         SetDirty()
@@ -4670,8 +4901,8 @@ ProfileDeleteOrClear(*) {
         if (MsgBox("Delete profile '" name "'? This cannot be undone after saving.", App.Name, "YesNo Icon! Default2") != "Yes")
             return
         PushUndo()
-        ; Has()-guarded: Map.Delete throws UnsetItemError on a missing key,
-        ; which would kill the handler mid-way and leave the UI stale
+        ; ! Has()-guarded: Map.Delete throws UnsetItemError on a missing
+        ;   key, which would kill the handler mid-way and leave the UI stale
         if App.Profiles.Has(name)
             App.Profiles.Delete(name)
         if App.ProfileMacros.Has(name)
@@ -4812,6 +5043,7 @@ RebuildProfilesMenu() {
     PopulateProfileDDL()
 }
 
+; Tray default item (single/double click): toggle the main window.
 TrayShowHide(*) {
     ToggleGui()
 }
@@ -4839,6 +5071,12 @@ NewProfileName() {
         SetStatus("Profile name cannot be empty")
         return ""
     }
+    ; ! same character rules as ProfileNameOk (Profiles tab) - a bad
+    ;   name here would corrupt keybinds.cfg on the next save
+    if (InStr(name, ";") || InStr(name, "[") || InStr(name, "]") || InStr(name, "*") || InStr(name, "|")) {
+        SetStatus("Profile name cannot contain special characters.")
+        return ""
+    }
     return name
 }
 
@@ -4853,18 +5091,7 @@ SwitchProfile(name) {
         App.Profiles[name] := Map()
     App.ActiveProfile := name
     App.Settings["ActiveProfile"] := name   ; persisted at next SaveSettings
-    if !App.ProfileMacros.Has(name)
-        App.ProfileMacros[name] := Map()
-    if !App.ProfileSettings.Has(name)
-        App.ProfileSettings[name] := Map()
-    App.MacroLib := App.ProfileMacros[name]
-    ps2 := App.ProfileSettings[name]
-    for , k in ["DoRepeatOutputs", "RepeatBuffer", "RepeatDelay"] {
-        if ps2.Has(k)
-            App.Settings[k] := ps2[k]
-        else
-            ps2[k] := App.Settings[k]
-    }
+    SetProfileView(name)   ; macro/settings view + sanitized 3-setting sync
     FillProfilesTab()
     RegisterAllHotkeys()
     RebuildProfilesMenu()
@@ -4915,8 +5142,12 @@ Undo(*) {
     snap := App.UndoStack.Pop()
     UnregisterAllHotkeys()
     App.Profiles[snap.Profile] := snap.Bindings
-    if snap.HasProp("Macros")
+    if snap.HasProp("Macros") {
         App.MacroLib := snap.Macros
+        ; ! keep the profile store in sync with the restored view, else
+        ;   switching away and back would resurrect the undone macros
+        App.ProfileMacros[snap.Profile] := snap.Macros
+    }
     App.ActiveProfile := snap.Profile
     App.Settings["ActiveProfile"] := snap.Profile
     RegisterAllHotkeys()
@@ -4968,7 +5199,7 @@ RecordMacroFlow() {
         return
     }
     mname := Trim(ib.Value)
-    if (InStr(mname, ";") || InStr(mname, "[") || InStr(mname, "]") || InStr(mname, "*")) {
+    if (InStr(mname, ";") || InStr(mname, "[") || InStr(mname, "]") || InStr(mname, "*") || InStr(mname, "|")) {
         SetStatus("Macro name cannot contain special characters - not saved")
         return
     }
@@ -4992,8 +5223,8 @@ BuildRecorderEndKeys() {
 ; Facts section 5 copy-ready loop: "V" passes keystrokes through
 ; to the active window; buffer resets on every Start(); Escape
 ; terminates and is NOT appended; EndKey comes back normalized.
-; Recorded TEXT is escaped so literal !, #, +, ^, { and } replay as
-; characters instead of modifiers/braces (security review F13).
+; * Recorded TEXT is escaped so literal !, #, +, ^, { and } replay
+;   as characters instead of modifiers/braces (security review F13).
 RecordMacro(endKeys) {
     seq := ""
     ih := InputHook("V", endKeys)
@@ -5039,7 +5270,7 @@ DoExit(*) {
 }
 
 ; Vetoable OnExit callback. Rules (all doc-verified):
-; - never throw, never call ExitApp inside the callback;
+; ! - never throw, never call ExitApp inside the callback;
 ; - always try SaveSettings() first;
 ; - never block Logoff/Shutdown; Single (replacing instance)
 ;   exits WITHOUT saving bindings (the file may have been edited
@@ -5061,7 +5292,7 @@ ExitFunc(ExitReason, ExitCode) {
             , App.Name, "YesNoCancel Icon! Default2")
         if (result = "Yes") {
             if SaveConfig(App.ConfigFile) {
-                App.ExitConfirmed := true
+                ; // App.ExitConfirmed := true removed - never read anywhere
                 return 0
             }
             LogError("exit save failed - config not written")
