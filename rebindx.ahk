@@ -56,6 +56,7 @@ class App {
     static Profiles := Map()        ; profileName -> Map(bindingId -> bindingMap)
     static ActiveProfile := "Default"
     static ActiveHotkeys := Map()   ; "key|scope" -> dispatcher fn (ONE per hotkey VARIANT)
+    static VariantIcp := Map()      ; "key|scope" -> interception type the variant is registered under
     static Settings := Map()
     static Shells := []            ; detected shells: Maps {Id, Name, Path, ArgStyle, Family}
     static Seq := 0                ; registration sequence: "later binding wins" per variant
@@ -78,6 +79,7 @@ class App {
     static Theme := Map()
     static UndoStack := []           ; max 10 snapshots: {Profile, Bindings, Macros}
     static IsDirty := false
+    static Suspended := false   ; custom suspend: triggers not intercepted (F1/window/tray stay live)
     ; // ExitConfirmed removed - written in ExitFunc but never read
     static CTab := 1
     static MainGui := 0
@@ -180,6 +182,14 @@ InitApp() {
     ;   under --silent, where a modal dialog would block invisibly
     if (App.Settings["GuiVisible"])
         ShowCfgReport(report)
+    ; * start-as-suspended: seed the flag BEFORE the GUI build so the
+    ;   Suspend button shows the right caption; F1/tray stay live
+    ;   (RegisterAppHotkeys runs after this)
+    App.Suspended := App.Settings["StartSuspended"] ? true : false
+    if (App.Suspended) {
+        UnregisterAllHotkeys()
+        App.PixelWatchers := []
+    }
     BuildMainGui()
     ApplyTheme()
     InitRowIcons()
@@ -264,8 +274,18 @@ ClearStatus(*) {
 
 ; Mark bindings as changed (BUG-08). Set by every mutation,
 ; cleared by a successful SaveConfig of the main config file.
+; * Autosave: a debounced -500 timer fires a SILENT save - changes
+;   persist without any status-strip feedback.
 SetDirty() {
     App.IsDirty := true
+    if (App.Settings["Autosave"])
+        SetTimer(AutosaveFire, -500)
+}
+
+; Silent debounced autosave (armed by SetDirty when Autosave is on).
+AutosaveFire() {
+    if (App.Settings["Autosave"] && App.IsDirty)
+        SaveConfig(App.ConfigFile, true)
 }
 
 ; Total number of bindings across all profiles.
@@ -285,8 +305,8 @@ SafeInt(v, def) {
         if IsInteger(v)
             return Integer(v)
         v := Trim("" v)
-        if RegExMatch(v, "^-?\d+(\.\d+)?$")
-            return Integer(RegExReplace(v, "\.\d+$", ""))
+        if RegExMatch(v, "^-?\d+([.,]\d+)?$")
+            return Integer(RegExReplace(v, "[.,]\d+$", ""))
     } catch as Err {
         ; a sanitizer must never throw
     }
@@ -478,6 +498,8 @@ LoadSettings() {
     s["ShellHidden"] := 1
     s["WarnedDefaultOverride"] := 0
     s["GuiVisible"] := 1
+    s["StartSuspended"] := 0
+    s["Autosave"] := 0
     s["DoStartup"] := FileExist(App.StartupLnk) ? 1 : 0   ; seeded, never persisted
     EnsureIniUtf16(App.IniFile)
     if FileExist(App.IniFile) {
@@ -488,6 +510,8 @@ LoadSettings() {
         s["ShellCmd"] := ReadIniStr("ShellCmd", "cmd")
         s["ShellHidden"] := ReadIniInt("ShellHidden", 1, 0, 1)
         s["GuiVisible"] := ReadIniInt("GuiVisible", 1, 0, 1)
+        s["StartSuspended"] := ReadIniInt("StartSuspended", 0, 0, 1)
+        s["Autosave"] := ReadIniInt("Autosave", 0, 0, 1)
     }
     ; ShellCmd is now a shell Id; "cmd" and "powershell" from older
     ; versions remain valid Ids. Reconcile against the detected list
@@ -517,6 +541,8 @@ SaveSettings() {
         IniWrite(App.Settings["ShellCmd"], App.IniFile, "SETTINGS", "ShellCmd")
         IniWrite(App.Settings["ShellHidden"], App.IniFile, "SETTINGS", "ShellHidden")
         IniWrite(App.Settings["GuiVisible"], App.IniFile, "SETTINGS", "GuiVisible")
+        IniWrite(App.Settings["StartSuspended"], App.IniFile, "SETTINGS", "StartSuspended")
+        IniWrite(App.Settings["Autosave"], App.IniFile, "SETTINGS", "Autosave")
     } catch as Err {
         LogError("settings write failed: " Err.Message)
     }
@@ -812,6 +838,7 @@ LoadConfig(file, &report, register := true) {
         }
         if (SubStr(keypart, 1, 3) = "hs:" || SubStr(keypart, 1, 3) = "px:") {
             key := keypart
+            icp := ""
             if (SubStr(key, 1, 3) = "hs:") {
                 hsText := SubStr(key, 4)
                 if (hsText = "" || InStr(hsText, "|")) {
@@ -841,6 +868,12 @@ LoadConfig(file, &report, register := true) {
                 }
             }
         } else {
+            ; trailing ~/$/* run = the interception type (B~, B$* ...)
+            icp := ""
+            if RegExMatch(keypart, "[~$*]+$", &im) {
+                icp := im[0]
+                keypart := SubStr(keypart, 1, StrLen(keypart) - StrLen(icp))
+            }
             key := NormalizeKey(keypart)
             if (key = "") {
                 report.Push({Line: lineNo, Text: raw, Reason: "invalid key '" keypart "'"})
@@ -859,15 +892,25 @@ LoadConfig(file, &report, register := true) {
         ; Seq preserves "later line wins" across restarts: the
         ; dispatcher picks the highest-Seq enabled binding per variant
         App.Seq++
-        curProfile[id] := Map("Type", type, "Key", key, "Scope", scope, "Action", action, "Enabled", enabled, "Seq", App.Seq)
+        curProfile[id] := Map("Type", type, "Key", key, "Scope", scope, "Action", action, "Enabled", enabled, "Icp", icp, "Seq", App.Seq)
     }
     ; commit: replace all profiles, one register pass, one refresh
     UnregisterAllHotkeys()
     App.Profiles := newProfiles
     App.ProfileMacros := newPMacros
     App.ProfileSettings := newPSettings
+    ; * the LAST active profile (INI) is restored at launch: a name
+    ;   missing from the cfg is created empty instead of falling back
+    ;   to Default - closing without saving must not lose the selection
     want2 := App.Settings["ActiveProfile"]
-    App.ActiveProfile := (want2 != "" && newProfiles.Has(want2)) ? want2 : "Default"
+    if (want2 = "")
+        want2 := "Default"
+    if !newProfiles.Has(want2) {
+        newProfiles[want2] := Map()
+        newPMacros[want2] := Map()
+        newPSettings[want2] := Map()
+    }
+    App.ActiveProfile := want2
     SetProfileView(App.ActiveProfile)
     ; // App.MacroLib := App.ProfileMacros[App.ActiveProfile] - removed:
     ; // redundant, SetProfileView already pointed the view at the profile
@@ -910,7 +953,7 @@ ShowCfgReport(report) {
 ; * The write is ATOMIC: the text goes to a .tmp file which then
 ;   replaces the target via FileMove, so a crash / disk-full / AV
 ;   lock can never destroy the old config (security review F2).
-SaveConfig(file := "") {
+SaveConfig(file := "", quiet := false) {
     if (file = "")
         file := App.ConfigFile
     tmp := file ".tmp"
@@ -927,10 +970,12 @@ SaveConfig(file := "") {
     }
     if (file = App.ConfigFile) {
         App.IsDirty := false
-        n := CountAllBindings()
-        SetStatus("Saved " n " bindings")
-        TrayTip("Saved " n " bindings", App.Name, "Iconi")
-    } else {
+        if !quiet {   ; * autosave fires silently - no status-strip feedback
+            n := CountAllBindings()
+            SetStatus("Saved " n " bindings")
+            TrayTip("Saved " n " bindings", App.Name, "Iconi")
+        }
+    } else if !quiet {
         SetStatus("Exported " CountAllBindings() " bindings")
     }
     return true
@@ -993,7 +1038,7 @@ ProfileSectionText(name, profile) {
 ; * {SEMICOLON} escaping makes literal semicolons round-trip - the
 ;   grammar's one hard separator.
 FormatBindingLine(b) {
-    keyText := (b["Enabled"] ? "" : "*") . b["Key"] . (b["Scope"] != "" ? "[" b["Scope"] "]" : "")
+    keyText := (b["Enabled"] ? "" : "*") . b["Key"] . BindingIcp(b) . (b["Scope"] != "" ? "[" b["Scope"] "]" : "")
     return keyText ";" StrReplace(b["Action"], ";", "{SEMICOLON}")
 }
 
@@ -1004,11 +1049,9 @@ SaveBindings(*) {
     SaveConfig(App.ConfigFile)
 }
 
-; Apply: identical to Save (kept as its own sidebar button for muscle
-; memory - hotkey changes apply live, saving persists them).
-ApplyBindings(*) {
-    SaveBindings()
-}
+; // Apply button + ApplyBindings removed (round 114): binding changes
+; // apply live (the engine registers on every mutation) and Autosave
+; // covers persistence; the button slot is now Suspend/Unsuspend.
 
 LoadBindings(*) {
     report := []
@@ -1177,6 +1220,17 @@ HkName(key) {
     return "$" key
 }
 
+; Variant name = engine hook prefix + the binding's interception
+; type ("" = none).
+; * the engine "$" is skipped when the user's own prefix already
+;   contains it (no "$$B" doubles)
+HkVariantName(key, icp) {
+    p := icp
+    if !InStr(p, "$")
+        p := "$" p
+    return p key
+}
+
 ; --- Hotkey variant DISPATCHER architecture (runtime round 3) ---
 ; * One hotkey VARIANT per unique Key+Scope carries ONE dispatcher
 ; callback that is installed a single time and NEVER swapped. At
@@ -1194,7 +1248,7 @@ HkName(key) {
 ; variant exists. The variant's On/Off state is reconciled from the
 ; bindings, and the criterion is set explicitly and reset after
 ; (facts 3f thread gotcha).
-RegHotkey(type, keyText, scope, action, enabled) {
+RegHotkey(type, keyText, scope, action, enabled, icp := "") {
     ; The trigger may be a hotkey, "hs:..." (hotstring) or "px:..."
     ; (pixel watch) - the last two skip the hotkey grammar.
     key := ""
@@ -1216,6 +1270,7 @@ RegHotkey(type, keyText, scope, action, enabled) {
     b["Scope"] := scope
     b["Action"] := action
     b["Enabled"] := enabled ? true : false
+    b["Icp"] := icp
     App.Seq++
     b["Seq"] := App.Seq
     if (SubStr(key, 1, 3) = "hs:") {
@@ -1274,6 +1329,9 @@ EnsureVariant(key, scope) {
         return
     fn := BindingDispatch.Bind(key, scope)
     App.ActiveHotkeys[vkey] := fn
+    ; * the interception type comes from the effective binding
+    icp := EffectiveBindingIcp(key, scope)
+    App.VariantIcp[vkey] := icp
     ; ! the HotIf criterion is set explicitly and reset after: a
     ;   leaked criterion would register the NEXT variant under the
     ;   wrong window rule (facts 3f thread gotcha) - same pattern at
@@ -1282,13 +1340,13 @@ EnsureVariant(key, scope) {
         HotIfWinActive(scope)
     else
         HotIf()
-    try Hotkey(HkName(key), fn, "On")
+    try Hotkey(HkVariantName(key, icp), fn, "On")
     catch as Err {
         LogError("register hotkey " key ": " Err.Message)
         SetStatus("Hotkey registration failed for " key " - see error log")
     }
     HotIf()
-    EnsureUpVariant(key, scope)
+    EnsureUpVariant(key, scope, icp)
 }
 
 ; Variant On/Off follows whether ANY enabled binding exists for the
@@ -1306,16 +1364,34 @@ ReconcileVariant(key, scope) {
             break
         }
     }
+    effIcp := EffectiveBindingIcp(key, scope)
+    curIcp := App.VariantIcp.Has(vkey) ? App.VariantIcp[vkey] : ""
     if (scope != "")
         HotIfWinActive(scope)
     else
         HotIf()
-    try Hotkey(HkName(key), , anyEnabled ? "On" : "Off")
-    catch as Err {
-        LogError((anyEnabled ? "enable" : "disable") " hotkey " key ": " Err.Message)
+    if (curIcp != effIcp) {
+        ; * the interception type follows the effective binding - a
+        ;   change is the ONE case that re-registers the variant name
+        if (curIcp != "") {
+            try Hotkey(HkVariantName(key, curIcp), , "Off")
+            catch as ErrO {
+                LogError("retire variant " key " (" curIcp "): " ErrO.Message)
+            }
+        }
+        try Hotkey(HkVariantName(key, effIcp), App.ActiveHotkeys[vkey], anyEnabled ? "On" : "Off")
+        catch as Err {
+            LogError("re-register variant " key ": " Err.Message)
+        }
+        App.VariantIcp[vkey] := effIcp
+    } else {
+        try Hotkey(HkVariantName(key, curIcp), , anyEnabled ? "On" : "Off")
+        catch as Err {
+            LogError((anyEnabled ? "enable" : "disable") " hotkey " key ": " Err.Message)
+        }
     }
     HotIf()
-    EnsureUpVariant(key, scope)
+    EnsureUpVariant(key, scope, effIcp)
 }
 
 ; The dispatcher: resolve the effective binding and invoke its
@@ -1347,6 +1423,19 @@ EffectiveBindingId(key, scope) {
     return best
 }
 
+; Interception type of a binding ("" for legacy maps without the field).
+BindingIcp(b) {
+    return (IsObject(b) && b.Has("Icp")) ? b["Icp"] : ""
+}
+
+; Effective interception type = the effective ("later wins") binding's.
+EffectiveBindingIcp(key, scope) {
+    id := EffectiveBindingId(key, scope)
+    if (id = "")
+        return ""
+    return BindingIcp(GetBinding(id))
+}
+
 ; Turn off every registered variant of the active profile.
 ; ! Keys are snapshotted before iterating: deleting from a Map
 ;   while enumerating it skips entries (BUG-05). TargetError is
@@ -1363,7 +1452,7 @@ UnregisterAllHotkeys() {
             HotIfWinActive(scope)
         else
             HotIf()
-        try Hotkey(HkName(key), , "Off")
+        try Hotkey(HkVariantName(key, App.VariantIcp.Has(vkey) ? App.VariantIcp[vkey] : ""), , "Off")
         catch TargetError {
             LogError("unregister: no variant for " key)
         }
@@ -1385,7 +1474,7 @@ UnregisterAllHotkeys() {
             HotIfWinActive(scope)
         else
             HotIf()
-        try Hotkey(HkName(key) " up", , "Off")
+        try Hotkey(HkVariantName(key, App.VariantIcp.Has(vkey) ? App.VariantIcp[vkey] : "") " up", , "Off")
         catch TargetError {
         }
         catch as Err {
@@ -1394,6 +1483,7 @@ UnregisterAllHotkeys() {
         HotIf()
     }
     App.UpHotkeys.Clear()
+    App.VariantIcp.Clear()
     ; hotstring triggers
     hids := []
     for id, fn in App.Hotstrings
@@ -1418,6 +1508,8 @@ UnregisterAllHotkeys() {
 ; Register one variant per unique Key+Scope present in the active
 ; profile; On/Off reconciled from the bindings afterwards.
 RegisterAllHotkeys() {
+    if (App.Suspended)
+        return   ; * suspended: triggers stay down; UnsuspendTriggers() re-registers
     App.ActiveHotkeys.Clear()
     App.Hotstrings.Clear()
     for id, b in ActiveProfileMap() {
@@ -1797,8 +1889,9 @@ BuildMainGui() {
     App.Ui["ClrBtn"].OnEvent("Click", ClearBindings)
     App.Ui["UndoBtn"] := g.Add("Button", "xs y+m w" btnW " h" btnH BtnBg(), "Undo")
     App.Ui["UndoBtn"].OnEvent("Click", Undo)
-    App.Ui["ApplyBtn"] := g.Add("Button", "xs y+m w" btnW " h" btnH BtnBg(), "Apply")
-    App.Ui["ApplyBtn"].OnEvent("Click", ApplyBindings)
+    App.Ui["SuspendBtn"] := g.Add("Button", "xs y+m w" btnW " h" btnH BtnBg()
+        , App.Suspended ? "Unsuspend" : "Suspend")
+    App.Ui["SuspendBtn"].OnEvent("Click", ToggleSuspendBtn)
     App.Ui["SaveBtn"] := g.Add("Button", "xs y+m w" btnW " h" btnH BtnBg(), "Save")
     App.Ui["SaveBtn"].OnEvent("Click", SaveBindings)
     App.Ui["SaveToBtn"] := g.Add("Button", "xs y+m w" btnW " h" btnH BtnBg(), "Save to...")
@@ -1891,31 +1984,31 @@ BuildMainGui() {
     ; -- Tab 6: Settings --
     tabs.UseTab(6)
     row1 := 10
-    g.Add("Text", "x(contentX+10) yc+" row1 " w" lblW " h24 +BackgroundTrans", "Repeat outputs while held (remaps only)")
-    App.Ui["RepeatBtn"] := g.Add("Button", "x(contentX+350) yc+" (row1 - 2) " w100 h28" BtnBg()
+    g.Add("Text", "x(contentX+10) y" (contentY+36+row1) " w" lblW " h24 +BackgroundTrans", "Repeat outputs while held (remaps only)")
+    App.Ui["RepeatBtn"] := g.Add("Button", "x(contentX+350) y" (contentY+36+row1-2) " w100 h28" BtnBg()
         , App.Settings["DoRepeatOutputs"] ? "Disable" : "Enable")   ; caption via Add text, later via .Text only (BUG-02)
     App.Ui["RepeatBtn"].OnEvent("Click", ToggleRepeat)
 
     row2 := row1 + rowH
-    g.Add("Text", "x(contentX+10) yc+" row2 " w" lblW " h24 +BackgroundTrans", "Repeat buffer (ms)")
+    g.Add("Text", "x(contentX+10) y" (contentY+36+row2) " w" lblW " h24 +BackgroundTrans", "Repeat buffer (ms)")
     ; Keysharp: UpDowns are standalone NumericUpDown controls with no
     ; buddy Edit, so one control replaces the old Edit+UpDown pair.
-    App.Ui["RepeatBufUD"] := g.Add("UpDown", "x(contentX+350) yc+" row2 " w100 h24 Range0-1000", App.Settings["RepeatBuffer"])
+    App.Ui["RepeatBufUD"] := g.Add("UpDown", "x(contentX+350) y" (contentY+36+row2) " w100 h24 Range0-1000", App.Settings["RepeatBuffer"])
     App.Ui["RepeatBufUD"].OnEvent("Change", OnRepeatBufChange)
 
     row3 := row2 + rowH
-    g.Add("Text", "x(contentX+10) yc+" row3 " w" lblW " h24 +BackgroundTrans", "Repeat delay (ms)")
-    App.Ui["RepeatDelayUD"] := g.Add("UpDown", "x(contentX+350) yc+" row3 " w100 h24 Range0-500", App.Settings["RepeatDelay"])
+    g.Add("Text", "x(contentX+10) y" (contentY+36+row3) " w" lblW " h24 +BackgroundTrans", "Repeat delay (ms)")
+    App.Ui["RepeatDelayUD"] := g.Add("UpDown", "x(contentX+350) y" (contentY+36+row3) " w100 h24 Range0-500", App.Settings["RepeatDelay"])
     App.Ui["RepeatDelayUD"].OnEvent("Change", OnRepeatDelayChange)
 
     row4 := row3 + rowH
-    g.Add("Text", "x(contentX+10) yc+" row4 " w" lblW " h24 +BackgroundTrans", "Run at startup (requires admin)")
-    App.Ui["StartupBtn"] := g.Add("Button", "x(contentX+350) yc+" (row4 - 2) " w100 h28" BtnBg()
+    g.Add("Text", "x(contentX+10) y" (contentY+36+row4) " w" lblW " h24 +BackgroundTrans", "Run at startup (requires admin)")
+    App.Ui["StartupBtn"] := g.Add("Button", "x(contentX+350) y" (contentY+36+row4-2) " w100 h28" BtnBg()
         , App.Settings["DoStartup"] ? "Disable" : "Enable")
     App.Ui["StartupBtn"].OnEvent("Click", ToggleStartup)
 
     row5 := row4 + rowH
-    g.Add("Text", "x(contentX+10) yc+" row5 " w" lblW " h24 +BackgroundTrans", "Shell for & commands")
+    g.Add("Text", "x(contentX+10) y" (contentY+36+row5) " w" lblW " h24 +BackgroundTrans", "Shell for & commands")
     shellNames := []
     shellIdx := 1
     for i, sh in App.Shells {
@@ -1925,14 +2018,26 @@ BuildMainGui() {
     }
     if (shellNames.Length = 0)
         shellNames.Push("cmd")   ; defensive: DetectShells guarantees one
-    App.Ui["ShellDDL"] := g.Add("DDL", "x(contentX+350) yc+" (row5 - 2) " w150 Choose" shellIdx, shellNames)
+    App.Ui["ShellDDL"] := g.Add("DDL", "x(contentX+350) y" (contentY+36+row5-2) " w150 Choose" shellIdx, shellNames)
     App.Ui["ShellDDL"].OnEvent("Change", OnShellDDLChange)
 
     row6 := row5 + rowH
-    g.Add("Text", "x(contentX+10) yc+" row6 " w" lblW " h24 +BackgroundTrans", "Console window")
-    App.Ui["ShellVisBtn"] := g.Add("Button", "x(contentX+350) yc+" (row6 - 2) " w100 h28" BtnBg()
+    g.Add("Text", "x(contentX+10) y" (contentY+36+row6) " w" lblW " h24 +BackgroundTrans", "Console window")
+    App.Ui["ShellVisBtn"] := g.Add("Button", "x(contentX+350) y" (contentY+36+row6-2) " w100 h28" BtnBg()
         , App.Settings["ShellHidden"] ? "Hidden" : "Visible")
     App.Ui["ShellVisBtn"].OnEvent("Click", ToggleShellVis)
+
+    row7 := row6 + rowH
+    g.Add("Text", "x(contentX+10) y" (contentY+36+row7) " w" lblW " h24 +BackgroundTrans", "Start as suspended (unsuspend manually to arm triggers)")
+    App.Ui["StartSuspBtn"] := g.Add("Button", "x(contentX+350) y" (contentY+36+row7-2) " w100 h28" BtnBg()
+        , App.Settings["StartSuspended"] ? "Disable" : "Enable")
+    App.Ui["StartSuspBtn"].OnEvent("Click", ToggleStartSuspended)
+
+    row8 := row7 + rowH
+    g.Add("Text", "x(contentX+10) y" (contentY+36+row8) " w" lblW " h24 +BackgroundTrans", "Autosave (save after changes, silently)")
+    App.Ui["AutosaveBtn"] := g.Add("Button", "x(contentX+350) y" (contentY+36+row8-2) " w100 h28" BtnBg()
+        , App.Settings["Autosave"] ? "Disable" : "Enable")
+    App.Ui["AutosaveBtn"].OnEvent("Click", ToggleAutosave)
 
 
     ; -- Tab 7: Usage Guide - split into INNER sub-tabs (user request:
@@ -1955,11 +2060,11 @@ BuildMainGui() {
     guide.UseTab(4)
     App.Ui["GuideTxts"].Push(g.Add("Text", "x(contentX+10) y(contentY+36+10) w" gw " h" (tabH - 76) " +BackgroundTrans -Wrap", "MACROS`n- A macro is a reusable Send sequence stored in the macro library (Macros tab)`n- Bindings reference macros by name: a Key Remap output of macro:Name replays it`n- Editing a macro instantly updates every binding that uses it`n`nTHE BUILDER (Builder... button)`n- Build macros one action at a time: Key press (with hold duration), Key down, Key up, Wait (ms), Run command (with wait-until-return), Mouse move (X/Y, relative, hold a key while moving), Sequence (raw Send string)`n- Loop start / Loop end wrap a part of the sequence; loops need unique names`n- Endloop must match the innermost open loop, every loop must be closed before saving`n- Test run executes the current sequence once`n`nTRIGGER MODES (per macro)`n- On key press: fires when the assigned key goes down`n- On key release: fires when the assigned key goes up`n- Repeat while held: repeats with per-macro buffer/delay`n- Pixel watch: fires while the pixel at X,Y turns to / turns from a color; the watcher polls while ReBindX runs`n- Pixel capture may be unavailable on some compositors (watcher disables itself and logs once)`n`nMACRO GRAMMAR (stored per profile)`n- trg:press|release|repeat  trigger mode`n- rbuf:ms / rdel:ms  repeat buffer/delay`n- px:x,y,RRGGBB,to|from  pixel trigger`n- kd:Key / ku:Key / kp:Key[:holdMs]  key actions`n- w:ms  wait`n- run:cmd / rw:cmd  shell (async / wait)`n- mm:x,y,rel|abs[,hold:Key]  mouse move`n- loop:Name:Count ... endloop:Name  repetition`n- sq:string  raw Send sequence`n- A literal | inside a parameter is stored as {PIPE}"))
     guide.UseTab(5)
-    App.Ui["GuideTxts"].Push(g.Add("Text", "x(contentX+10) y(contentY+36+10) w" gw " h" (tabH - 76) " +BackgroundTrans -Wrap", "HOTSTRINGS`n- A hotstring fires when you TYPE its trigger text anywhere, then an ending character (space, Enter, etc.)`n- Set the Trigger type to Hotstring in the binding editor and type the trigger text`n- Replacement actions follow the binding grammar: >text sends text/keys, no prefix runs a command, & runs via the selected shell, macro:Name replays a library macro`n- The Hotstrings tab lists every hotstring binding with New/Edit/Delete/Toggle`n- Scope works for hotstrings too: [wintitle] limits where the text triggers`n`nPIXEL TRIGGERS`n- Trigger type Pixel: the binding fires when the screen pixel at X,Y turns to (or turns from) a color RRGGBB`n- Polls continuously while ReBindX runs; fires once per transition and re-arms when the color clears`n- A pixel watcher disables itself (with one log entry) on platforms where pixel capture is unavailable`n`nHOTKEY TRIGGERS`n- The classic form: a hotkey (e.g. #^G) fires the action on key press`n- Multiple bindings may share a hotkey: the LATEST enabled binding wins`n- Per-app scoping via [wintitle]"))
+    App.Ui["GuideTxts"].Push(g.Add("Text", "x(contentX+10) y(contentY+36+10) w" gw " h" (tabH - 76) " +BackgroundTrans -Wrap", "HOTSTRINGS`n- A hotstring fires when you TYPE its trigger text anywhere, then an ending character (space, Enter, etc.)`n- Set the Trigger type to Hotstring in the binding editor and type the trigger text`n- Replacement actions follow the binding grammar: >text sends text/keys, no prefix runs a command, & runs via the selected shell, macro:Name replays a library macro`n- The Hotstrings tab lists every hotstring binding with New/Edit/Delete/Toggle`n- Scope works for hotstrings too: [wintitle] limits where the text triggers`n`nPIXEL TRIGGERS`n- Trigger type Pixel: the binding fires when the screen pixel at X,Y turns to (or turns from) a color RRGGBB`n- Polls continuously while ReBindX runs; fires once per transition and re-arms when the color clears`n- A pixel watcher disables itself (with one log entry) on platforms where pixel capture is unavailable`n`nHOTKEY TRIGGERS`n- The classic form: a hotkey (e.g. #^G) fires the action on key press`n- Multiple bindings may share a hotkey: the LATEST enabled binding wins`n- Per-app scoping via [wintitle]`n- Interception (editor dropdown): ~ passthrough, $ force hook, * wildcard; combinable, stored as a key suffix (B~$)"))
     guide.UseTab(6)
     App.Ui["GuideTxts"].Push(g.Add("Text", "x(contentX+10) y(contentY+36+10) w" gw " h" (tabH - 76) " +BackgroundTrans -Wrap", "PROFILES`n- A profile bundles bindings, macros AND the three repeat settings`n- Active profile: pick from the dropdown and press Switch (or use the tray menu)`n- New profile...: create from current settings, clone an existing profile, or start empty`n- Save: writes the active profile (one-time warning before saving into Default)`n- Save As...: copy the active profile under a new name and switch to it`n- Rename: type a new name for the ACTIVE profile (disabled for Default)`n- Export... / Import...: single-profile config files, merge-on-import`n- Delete / Clear: removes a non-Default profile (Default is cleared instead)`n- Save to... (sidebar): copies the SELECTED bindings/macros/hotstrings into any profile without switching`n`nSTORAGE`n- Profiles live as [Profile:Name] sections in keybinds.cfg`n- The Default profile is the headerless section at the top`n- macro:Name and set:Key lines inside a section carry its macros and settings`n- Undo (Ctrl+Z) covers profile operations"))
     guide.UseTab(7)
-    App.Ui["GuideTxts"].Push(g.Add("Text", "x(contentX+10) y(contentY+36+10) w" gw " h" (tabH - 76) " +BackgroundTrans -Wrap", "USING THE WINDOW`n- F1 hides/shows this window (rebindable)`n- Click a row to select; Ctrl+click or Shift+click selects several`n- Double-click a row, or press Enter, to edit; Del deletes the selected rows`n- Right-click a row to toggle/edit/delete that one binding`n- Ctrl+Z undoes the last change (10 levels)`n- The Filter box above each list narrows rows as you type`n- Resize the window freely; the lists follow (the Usage Guide content sets the lower limit)`n`nSETTINGS TAB`n- Repeat outputs/buffer/delay: per-profile remap repeat behavior`n- Run at startup: creates the Startup shortcut (Windows, admin)`n- Shell for & commands + console visibility`n`nFILES`n- keybinds.cfg: bindings, remaps, macros, profiles (UTF-8)`n- rebindxsettings.ini: settings (UTF-16 on Windows/Win32; do not resave as UTF-8)`n- theme.cfg: optional colors; Auto=1 follows Windows dark/light mode`n- errors: error.log inside the ReBindX folder of the OS application-data directory`n- icons\gear.ico / keyboard.ico: list icons (missing icons degrade silently)"))
+    App.Ui["GuideTxts"].Push(g.Add("Text", "x(contentX+10) y(contentY+36+10) w" gw " h" (tabH - 76) " +BackgroundTrans -Wrap", "USING THE WINDOW`n- F1 hides/shows this window (rebindable)`n- Click a row to select; Ctrl+click or Shift+click selects several`n- Double-click a row, or press Enter, to edit; Del deletes the selected rows`n- Right-click a row to toggle/edit/delete that one binding`n- Ctrl+Z undoes the last change (10 levels)`n- The Filter box above each list narrows rows as you type`n- Resize the window freely; the lists follow (the Usage Guide content sets the lower limit)`n`nSETTINGS TAB`n- Repeat outputs/buffer/delay: per-profile remap repeat behavior`n- Run at startup: creates the Startup shortcut (Windows, admin)`n- Shell for & commands + console visibility`n- Start as suspended and Autosave: trigger/persistence defaults`n`nFILES`n- keybinds.cfg: bindings, remaps, macros, profiles (UTF-8)`n- rebindxsettings.ini: settings (UTF-16 on Windows/Win32; do not resave as UTF-8)`n- theme.cfg: optional colors; Auto=1 follows Windows dark/light mode`n- errors: error.log inside the ReBindX folder of the OS application-data directory`n- icons\gear.ico / keyboard.ico: list icons (missing icons degrade silently)"))
     guide.UseTab()
     SetUIThemeFont(g, "s10 c" App.Theme["Text"])
 
@@ -2283,6 +2388,7 @@ OnFilterKeyChange(ctrl, *) {
 ; Caption updates only through .Text - never .Value (BUG-02).
 ToggleRepeat(*) {
     App.Settings["DoRepeatOutputs"] := App.Settings["DoRepeatOutputs"] ? 0 : 1
+    SyncProfileSetting("DoRepeatOutputs")
     if App.Ui.Has("RepeatBtn")
         App.Ui["RepeatBtn"].Text := App.Settings["DoRepeatOutputs"] ? "Disable" : "Enable"
     SetStatus(App.Settings["DoRepeatOutputs"] ? "Repeat while held: on" : "Repeat while held: off")
@@ -2303,6 +2409,7 @@ SyncEditSetting(settingKey, editName, minV, maxV) {
     if (v > maxV)
         v := maxV
     App.Settings[settingKey] := v
+    SyncProfileSetting(settingKey)   ; write-through to the active profile
 }
 
 OnRepeatBufChange(*) {
@@ -2351,6 +2458,57 @@ ToggleShellVis(*) {
     if App.Ui.Has("ShellVisBtn")
         App.Ui["ShellVisBtn"].Text := App.Settings["ShellHidden"] ? "Hidden" : "Visible"
     SetStatus("& commands will run " (App.Settings["ShellHidden"] ? "hidden" : "visible"))
+}
+
+; * Custom suspend - NOT AHK's Suspend(): F1, the window, the tray and
+;   the recorder keep working; only the user's triggers stop
+;   intercepting and responding.
+SuspendTriggers() {
+    if (App.Suspended)
+        return
+    App.Suspended := true
+    UnregisterAllHotkeys()   ; hotkey variants, up-variants, hotstrings
+    App.PixelWatchers := []  ; watchers stop re-arming
+    if App.Ui.Has("SuspendBtn")
+        App.Ui["SuspendBtn"].Text := "Unsuspend"
+    SetStatus("Triggers suspended")
+}
+
+; Lift the custom suspend: re-register the active profile's triggers.
+UnsuspendTriggers() {
+    if (!App.Suspended)
+        return
+    App.Suspended := false
+    RegisterAllHotkeys()
+    RebuildPixelWatchers()
+    if App.Ui.Has("SuspendBtn")
+        App.Ui["SuspendBtn"].Text := "Suspend"
+    SetStatus("Triggers active")
+}
+
+; Suspend button (the old Apply slot): toggle the custom suspend.
+ToggleSuspendBtn(*) {
+    App.Suspended ? UnsuspendTriggers() : SuspendTriggers()
+}
+
+; Settings row 7: launch suspended until manually unsuspended.
+ToggleStartSuspended(*) {
+    App.Settings["StartSuspended"] := App.Settings["StartSuspended"] ? 0 : 1
+    if App.Ui.Has("StartSuspBtn")
+        App.Ui["StartSuspBtn"].Text := App.Settings["StartSuspended"] ? "Disable" : "Enable"
+    SaveSettings()
+    SetStatus(App.Settings["StartSuspended"] ? "Start as suspended: on" : "Start as suspended: off")
+}
+
+; Settings row 8: save after changes, silently (no status feedback).
+ToggleAutosave(*) {
+    App.Settings["Autosave"] := App.Settings["Autosave"] ? 0 : 1
+    if App.Ui.Has("AutosaveBtn")
+        App.Ui["AutosaveBtn"].Text := App.Settings["Autosave"] ? "Disable" : "Enable"
+    SaveSettings()
+    if (App.Settings["Autosave"] && App.IsDirty)
+        SetTimer(AutosaveFire, -500)
+    SetStatus(App.Settings["Autosave"] ? "Autosave: on" : "Autosave: off")
 }
 
 ; Profiles tab Switch button: apply the DDL selection ("" = no-op).
@@ -2562,8 +2720,30 @@ AddBindingClicked(*) {
     OpenEditor("Add", "", pre)
 }
 
+; Interception-type dropdown entries (Hotkey triggers only). The
+; leading ~$* symbol run of each label IS the stored value.
+IcpLabels() {
+    return ["Unspecified", "~ Passthrough", "$ Force hook", "* Wildcard"
+        , "~$ Hook + passthrough", "~* Passthrough + wildcard", "$* Hook + wildcard", "~$* All three"]
+}
+
+; Label -> the ~$* symbol run it starts with ("" for Unspecified).
+IcpFromLabel(lbl) {
+    RegExMatch(lbl, "^[~$]*", &im)
+    return im[0]
+}
+
+; Stored ~$* run -> dropdown index (1 = Unspecified for unknowns).
+IcpLabelIndex(icp) {
+    for i, lbl in IcpLabels() {
+        if (IcpFromLabel(lbl) = icp)
+            return i
+    }
+    return 1
+}
+
 OpenEditor(mode := "Add", id := "", prefill := 0) {
-    st := Map("Mode", mode, "OrigId", "", "Type", "cmd", "Key", "", "Action", "", "Scope", "", "Trig", "hk")
+    st := Map("Mode", mode, "OrigId", "", "Type", "cmd", "Key", "", "Action", "", "Scope", "", "Trig", "hk", "Icp", "")
     if (mode = "Edit") {
         b := GetBinding(id)
         if IsObject(b) {
@@ -2572,6 +2752,7 @@ OpenEditor(mode := "Add", id := "", prefill := 0) {
             st["Key"] := b["Key"]
             st["Action"] := b["Action"]
             st["Scope"] := b["Scope"]
+            st["Icp"] := BindingIcp(b)
         } else {
             ; diagnostic (user report: edit mode opened empty) - if
             ; this appears in error.log, the row->id lookup failed
@@ -2597,53 +2778,57 @@ OpenEditor(mode := "Add", id := "", prefill := 0) {
     ed.Add("Text", "x16 y16 w66 h22", "Type:")
     typeDDL := ed.Add("DDL", "x86 y14 w140 vType", ["Command", "Key Remap"])
     typeDDL.OnEvent("Change", EditorTypeChange)
+    ; interception type (Hotkey triggers only): ~ / $ / * prefixes
+    ed.Add("Text", "x230 y16 w66 h22 vIcpLbl", "Intercept:")
+    icpDDL := ed.Add("DDL", "x300 y14 w150 vIcp Choose1", IcpLabels())
 
-        ed.Add("Text", "x16 y52 w66 h22 vKeyLbl", "Keybind:")
-    trigDDL := ed.Add("DDL", "x330 y50 w120 vTrig Choose1", ["Hotkey", "Hotstring", "Pixel"])
+    ed.Add("Text", "x16 y62 w66 h22 vKeyLbl", "Keybind:")
+    trigDDL := ed.Add("DDL", "x330 y60 w120 vTrig Choose1", ["Hotkey", "Hotstring", "Pixel"])
     trigDDL.OnEvent("Change", EditorTrigChange)
-    ed.Add("Edit", "x86 y50 w220 h22 vKeyEdit c" App.Theme["Text"] " +Background" App.Theme["Control"], st["Key"])
+    ed.Add("Edit", "x86 y60 w220 h22 vKeyEdit c" App.Theme["Text"] " +Background" App.Theme["Control"], st["Key"])
 
     ; key picker (feature 2): modifier checkboxes, then the category
-    ; and key DDLs stacked VERTICALLY with labels - GTK renders
-    ; combos/checkboxes wider than their declared width, so every
-    ; side-by-side pitch proved unreliable (user reports).
-    ed.Add("Text", "x16 y88 w66 h22 vPickerLbl", "Picker:")
-    ed.Add("CheckBox", "x86 y86 w56 h22 vModCtrl" BtnBg(), "Ctrl")
-    ed.Add("CheckBox", "x150 y86 w56 h22 vModAlt" BtnBg(), "Alt")
-    ed.Add("CheckBox", "x214 y86 w64 h22 vModShift" BtnBg(), "Shift")
-    ed.Add("CheckBox", "x288 y86 w56 h22 vModWin" BtnBg(), "Win")
+    ; and key DDLs stacked VERTICALLY with labels. Spacious layout
+    ; (user report: elements stacked over each other): every row gets
+    ; a 46-48px pitch so even GTK's taller-than-declared combos
+    ; (~30-32px) keep clear separation.
+    ed.Add("Text", "x16 y110 w66 h22 vPickerLbl", "Picker:")
+    ed.Add("CheckBox", "x86 y108 w56 h22 vModCtrl" BtnBg(), "Ctrl")
+    ed.Add("CheckBox", "x150 y108 w56 h22 vModAlt" BtnBg(), "Alt")
+    ed.Add("CheckBox", "x214 y108 w64 h22 vModShift" BtnBg(), "Shift")
+    ed.Add("CheckBox", "x288 y108 w56 h22 vModWin" BtnBg(), "Win")
     for , cbName in ["ModCtrl", "ModAlt", "ModShift", "ModWin"]
         ed[cbName].OnEvent("Click", PickerChange)
 
-    ed.Add("Text", "x16 y126 w66 h22 vCatLbl", "Category:")
-    catDDL := ed.Add("DDL", "x86 y124 w200 vKeyCat", PickerCategoryNames())
+    ed.Add("Text", "x16 y158 w66 h22 vCatLbl", "Category:")
+    catDDL := ed.Add("DDL", "x86 y156 w200 vKeyCat", PickerCategoryNames())
     catDDL.OnEvent("Change", EditorCatChange)
     catDDL.Choose(1)
-    ed.Add("Text", "x16 y162 w66 h22 vKeyPickLbl", "Key:")
-    keyDDL := ed.Add("DDL", "x86 y160 w200 vKeyPick", PickerKeysForCategory("Letters"))
+    ed.Add("Text", "x16 y206 w66 h22 vKeyPickLbl", "Key:")
+    keyDDL := ed.Add("DDL", "x86 y204 w200 vKeyPick", PickerKeysForCategory("Letters"))
     keyDDL.OnEvent("Change", PickerChange)
 
     isCmd := (st["Type"] = "cmd")
-    ed.Add("Text", "x16 y202 w66 h22 vActionLabel", isCmd ? "Command:" : "Output key:")
-    actionOpts := isCmd ? "x86 y200 w320 h80 Multi vAction" : "x86 y200 w320 h22 vAction"
+    ed.Add("Text", "x16 y254 w66 h22 vActionLabel", isCmd ? "Command:" : "Output key:")
+    actionOpts := isCmd ? "x86 y252 w320 h80 Multi vAction" : "x86 y252 w320 h22 vAction"
     ed.Add("Edit", actionOpts " c" App.Theme["Text"] " +Background" App.Theme["Control"], st["Action"])
 
-    ed.Add("Text", "x16 y292 w400 h22 vScopeLbl", "Window scope (optional) - e.g. ahk_exe chrome.exe")
-    ed.Add("Edit", "x86 y318 w320 h22 vScopeEdit c" App.Theme["Text"] " +Background" App.Theme["Control"], st["Scope"])
+    ed.Add("Text", "x16 y366 w400 h22 vScopeLbl", "Window scope (optional) - e.g. ahk_exe chrome.exe")
+    ed.Add("Edit", "x86 y392 w320 h22 vScopeEdit c" App.Theme["Text"] " +Background" App.Theme["Control"], st["Scope"])
 
     ; Pixel trigger fields (visible when Trigger = Pixel)
-    ed.Add("Text", "x16 y292 w60 h22 vPXT", "Pixel X:")
-    ed.Add("Edit", "x80 y290 w60 h22 vPX c" App.Theme["Text"] " +Background" App.Theme["Control"], 0)
-    ed.Add("Text", "x150 y292 w20 h22 vPYT", "Y:")
-    ed.Add("Edit", "x176 y290 w60 h22 vPY c" App.Theme["Text"] " +Background" App.Theme["Control"], 0)
-    ed.Add("Text", "x244 y292 w44 h22 vPCT", "Color:")
-    ed.Add("Edit", "x292 y290 w70 h22 vPC c" App.Theme["Text"] " +Background" App.Theme["Control"], "FFFFFF")
-    ed.Add("DDL", "x370 y290 w80 vPM Choose1", ["to", "from"])
-    testBtn := ed.Add("Button", "x86 y356 w90 h28" BtnBg(), "Test")
+    ed.Add("Text", "x16 y366 w60 h22 vPXT", "Pixel X:")
+    ed.Add("Edit", "x80 y364 w60 h22 vPX c" App.Theme["Text"] " +Background" App.Theme["Control"], 0)
+    ed.Add("Text", "x150 y366 w20 h22 vPYT", "Y:")
+    ed.Add("Edit", "x176 y364 w60 h22 vPY c" App.Theme["Text"] " +Background" App.Theme["Control"], 0)
+    ed.Add("Text", "x244 y366 w44 h22 vPCT", "Color:")
+    ed.Add("Edit", "x292 y364 w70 h22 vPC c" App.Theme["Text"] " +Background" App.Theme["Control"], "FFFFFF")
+    ed.Add("DDL", "x370 y364 w80 vPM Choose1", ["to", "from"])
+    testBtn := ed.Add("Button", "x235 y440 w90 h28" BtnBg(), "Test")
     testBtn.OnEvent("Click", TestRemap)
-    saveBtn := ed.Add("Button", "x186 y356 w90 h28" BtnBg(), "Save")
+    saveBtn := ed.Add("Button", "x335 y440 w90 h28" BtnBg(), "Save")
     saveBtn.OnEvent("Click", EditorSave.Bind(st))
-    cancelBtn := ed.Add("Button", "x286 y356 w90 h28" BtnBg(), "Cancel")
+    cancelBtn := ed.Add("Button", "x435 y440 w90 h28" BtnBg(), "Cancel")
     cancelBtn.OnEvent("Click", (*) => ed.Destroy())
 
     typeDDL.Choose(isCmd ? 1 : 2)
@@ -2664,11 +2849,12 @@ OpenEditor(mode := "Add", id := "", prefill := 0) {
     if (st["Trig"] = "hs")
         trigIdx := 2
     ed["Trig"].Choose(trigIdx)
+    ed["Icp"].Choose(IcpLabelIndex(st["Icp"]))
     ed["KeyEdit"].Value := dispKey
     EditorTrigChange(ed["Trig"])
     if (trigIdx = 1 && st["Key"] != "")
         SyncPickerFromKey(ed, st["Key"])
-    ed.Show("w480 h404")
+    ed.Show("w535 h490")
 }
 
 ; Trigger-type switch: the Keybind label text and the key picker
@@ -2679,7 +2865,7 @@ EditorTrigChange(ctrl, *) {
     trig := ctrl.Text
     hk := (trig = "Hotkey")
     try g["KeyLbl"].Text := hk ? "Keybind:" : (trig = "Hotstring") ? "Hotstring:" : "Pixel:"
-    for , n in ["PickerLbl", "ModCtrl", "ModAlt", "ModShift", "ModWin", "CatLbl", "KeyCat", "KeyPickLbl", "KeyPick"]
+    for , n in ["PickerLbl", "ModCtrl", "ModAlt", "ModShift", "ModWin", "CatLbl", "KeyCat", "KeyPickLbl", "KeyPick", "IcpLbl", "Icp"]
         try g[n].Visible := hk
     px := (trig = "Pixel")
     ; the pixel fields and the scope row trade places
@@ -2912,12 +3098,14 @@ EditorSave(st, ctrl, *) {
     ; trigger composition: Hotkey | Hotstring | Pixel
     trig := g["Trig"].Text
     key := ""
+    icp := ""
     if (trig = "Hotkey") {
         key := NormalizeKey(g["KeyEdit"].Value)
         if (key = "") {
             MsgBox("Invalid key format.", "Error", "Icon!")
             return
         }
+        icp := IcpFromLabel(g["Icp"].Text)
     } else if (trig = "Hotstring") {
         hsTxt := RegExReplace(Trim(g["KeyEdit"].Value), "i)^hs:")
         ; ; and | cannot survive the cfg grammar, [ and ] would be
@@ -2990,7 +3178,7 @@ EditorSave(st, ctrl, *) {
         if IsObject(ob)
             enabled := ob["Enabled"]
     }
-    RegHotkey(type, key, scope, action, enabled)
+    RegHotkey(type, key, scope, action, enabled, icp)
     SetDirty()
     RefreshGuiData()
     g.Destroy()
@@ -3375,7 +3563,7 @@ WantsKeyUpVariant(key, scope) {
 
 ; Register/reconcile the "key up" variant: created only when a
 ; release-trigger macro is (effectively) bound to this key+scope.
-EnsureUpVariant(key, scope) {
+EnsureUpVariant(key, scope, icp) {
     vkey := key "|" scope
     want := WantsKeyUpVariant(key, scope)
     if (want && !App.UpHotkeys.Has(vkey)) {
@@ -3385,7 +3573,7 @@ EnsureUpVariant(key, scope) {
             HotIfWinActive(scope)
         else
             HotIf()
-        try Hotkey(HkName(key) " up", fn, "On")
+        try Hotkey(HkVariantName(key, icp) " up", fn, "On")
         catch as Err {
             LogError("register key-up " key ": " Err.Message)
             App.UpHotkeys.Delete(vkey)
@@ -3396,7 +3584,7 @@ EnsureUpVariant(key, scope) {
             HotIfWinActive(scope)
         else
             HotIf()
-        try Hotkey(HkName(key) " up", , want ? "On" : "Off")
+        try Hotkey(HkVariantName(key, icp) " up", , want ? "On" : "Off")
         catch as Err {
             LogError("toggle key-up " key ": " Err.Message)
         }
@@ -3413,6 +3601,10 @@ RebuildPixelWatchers() {
     if !coordDone {
         coordDone := true
         try CoordMode("Pixel", "Screen")
+    }
+    if (App.Suspended) {
+        App.PixelWatchers := []   ; suspended: no polling until unsuspended
+        return
     }
     prev := App.PixelWatchers   ; fire/dead state carried across the rebuild
     App.PixelWatchers := []
@@ -3667,6 +3859,10 @@ BuildBuilderWindow() {
     bd.Add("Text", "x236 y116 w46 h22", "Color:")
     bd.Add("Edit", "x284 y114 w70 h22 vBPColor c" App.Theme["Text"] " +Background" App.Theme["Control"], "")
     bd.Add("DDL", "x360 y114 w130 vBPMode Choose1", ["turns to", "turns from"])
+    ; Test run lives on the header row now (right side margin, wider
+    ; than the old bottom-row button, which is Clone)
+    hdrTestBtn := bd.Add("Button", "x704 y110 w100 h28 vBTest" BtnBg(), "Test run")
+    hdrTestBtn.OnEvent("Click", BuilderTest)
     bd.Add("ListView", "x16 y164 w788 h278 vBLV NoSortHdr +Background" App.Theme["Background"]
         , ["#", "Action", "Value", "Detail"])
     lvb := bd["BLV"]
@@ -3689,8 +3885,8 @@ BuildBuilderWindow() {
     upBtn.OnEvent("Click", BuilderMove.Bind(-1))
     downBtn := bd.Add("Button", "x444 y502 w60 h28 vBDown" BtnBg(), "Down")
     downBtn.OnEvent("Click", BuilderMove.Bind(1))
-    testBtn := bd.Add("Button", "x534 y502 w84 h28 vBTest" BtnBg(), "Test run")
-    testBtn.OnEvent("Click", BuilderTest)
+    cloneBtn := bd.Add("Button", "x534 y502 w84 h28 vBClone" BtnBg(), "Clone")
+    cloneBtn.OnEvent("Click", BuilderCloneAction)
     saveBtn := bd.Add("Button", "x628 y502 w84 h28 vBSave" BtnBg(), "Save")
     saveBtn.OnEvent("Click", BuilderSave)
     cancelBtn := bd.Add("Button", "x722 y502 w72 h28 vBCancel" BtnBg(), "Cancel")
@@ -3721,7 +3917,7 @@ BuilderSize(bd, minMax, w, h) {
     }
     try {
         btnY := h - 28 - 6
-        for , n in ["BAdd", "BEdit", "BDelBtn", "BUp", "BDown", "BTest", "BSave", "BCancel"]
+        for , n in ["BAdd", "BEdit", "BDelBtn", "BUp", "BDown", "BClone", "BSave", "BCancel"]
             bd[n].Move(, btnY)
     } catch as ErrB {
         LogError("builder buttons resize: " ErrB.Message)
@@ -3768,6 +3964,50 @@ BuilderMove(delta, *) {
     App.BuilderRows.RemoveAt(row)
     App.BuilderRows.InsertAt(target, moved)
     FillBuilderList()
+}
+
+; Clone the SELECTED action(s): one row duplicates right after
+; itself; a multi-selection pastes (in order) after the LAST
+; selected row - one function covers both cases. The selection
+; moves onto the clones so repeated presses compound.
+BuilderCloneAction(*) {
+    if !IsObject(App.BuilderGui)
+        return
+    lv := App.BuilderGui["BLV"]
+    rows := []
+    row := lv.GetNext(0)
+    while (row != 0) {
+        rows.Push(row)
+        row := lv.GetNext(row)
+    }
+    if (rows.Length = 0) {
+        SetStatus("Select an action first")
+        return
+    }
+    ; snapshot the tokens BEFORE any insert shifts the indices
+    toks := []
+    for , r in rows
+        toks.Push(App.BuilderRows[r].Tok)
+    pos := rows[rows.Length]
+    for , tok in toks {
+        App.BuilderRows.InsertAt(pos + 1, {Tok: tok})
+        pos++
+    }
+    FillBuilderList()
+    ; move the selection onto the clones (guarded: a Keysharp LV
+    ; Modify quirk must never break the clone itself)
+    try {
+        lv.Modify(0, "-Select")
+        i := rows[rows.Length] + 1
+        while (i <= rows[rows.Length] + toks.Length) {
+            lv.Modify(i, "Select")
+            i++
+        }
+    }
+    catch as Err {
+        LogError("clone selection: " Err.Message)
+    }
+    SetStatus("Cloned " toks.Length " action(s)")
 }
 
 ; Test: execute the current rows as a sequence (header ignored).
@@ -4385,6 +4625,16 @@ SetProfileView(name) {
     }
 }
 
+; * Write-through for the three per-profile repeat settings: every
+;   live change lands in the ACTIVE profile's store immediately, so
+;   Save + restart restores them from the profile (the INI value is
+;   only the fallback when the profile has no set: line yet).
+SyncProfileSetting(k) {
+    if !App.ProfileSettings.Has(App.ActiveProfile)
+        App.ProfileSettings[App.ActiveProfile] := Map()
+    App.ProfileSettings[App.ActiveProfile][k] := App.Settings[k]
+}
+
 ; Refresh the Profiles tab widgets from the current state.
 FillProfilesTab() {
     if !App.Ui.Has("ProfNameEdit")
@@ -4675,16 +4925,22 @@ ProfileImport(*) {
                 }
                 type := (section = "key") ? "key" : "cmd"
                 id := ""
+                icp := ""
                 if (SubStr(keypart, 1, 3) = "hs:" || SubStr(keypart, 1, 3) = "px:") {
                     id := "cmd|" keypart "|" scope
                 } else {
+                    ; trailing ~/$/* run = the interception type
+                    if RegExMatch(keypart, "[~$*]+$", &im2) {
+                        icp := im2[0]
+                        keypart := SubStr(keypart, 1, StrLen(keypart) - StrLen(icp))
+                    }
                     nk := NormalizeKey(keypart)
                     if (nk = "")
                         continue
                     id := type "|" nk "|" scope
                 }
                 act := (type = "key") ? NormalizeAction(payload) : payload
-                curP[id] := Map("Type", type, "Key", SubStr(id, InStr(id, "|") + 1, InStr(id, "|", false, InStr(id, "|") + 1) - InStr(id, "|") - 1), "Scope", scope, "Action", act, "Enabled", enabled, "Seq", ++App.Seq)
+                curP[id] := Map("Type", type, "Key", SubStr(id, InStr(id, "|") + 1, InStr(id, "|", false, InStr(id, "|") + 1) - InStr(id, "|") - 1), "Scope", scope, "Action", act, "Enabled", enabled, "Icp", icp, "Seq", ++App.Seq)
                 added++
             }
         }
@@ -4746,7 +5002,8 @@ SyncProfileSettings() {
 }
 
 ; Sidebar "Save to...": copy the SELECTED items (bindings / macros /
-; hotstrings, per the active tab) into a chosen profile.
+; hotstrings, per the active tab) into a profile picked from a
+; dropdown of every existing profile + "New empty profile...".
 SaveSelectedTo(*) {
     names := []
     ids := []
@@ -4780,12 +5037,50 @@ SaveSelectedTo(*) {
         SetStatus("Select the item(s) to save first")
         return
     }
-    ib := InputBox("Save " (names.Length + ids.Length) " selected item(s) to profile:", App.Name " - Save To", "w400 h160")
-    if (ib.Result != "OK")
+    ; profile picker: every existing profile + "New empty profile..."
+    ; (replaces the old free-typed InputBox - user request, round 115)
+    sd := Gui("-MaximizeBox +Owner" App.MainGui.Hwnd " +OwnDialogs", App.Name " - Save To")
+    sd.BackColor := App.Theme["Background"]
+    ThemedFont(sd, "s10 c" App.Theme["Text"])
+    sd.Add("Text", "x16 y16 w340 h22", "Save " (names.Length + ids.Length) " selected item(s) to profile:")
+    sd.Add("DDL", "x16 y44 w340 vPProf Choose1", SaveToChoices())
+    okBtn := sd.Add("Button", "x96 y92 w100 h30" BtnBg(), "Save")
+    okBtn.OnEvent("Click", SaveToPicked.Bind(sd, ids, names))
+    caBtn := sd.Add("Button", "x206 y92 w100 h30" BtnBg(), "Cancel")
+    caBtn.OnEvent("Click", (*) => sd.Destroy())
+    sd.OnEvent("Close", (*) => sd.Destroy())
+    sd.OnEvent("Escape", (*) => sd.Destroy())
+    sd.Show("w390 h150")
+}
+
+; Dropdown entries for Save to...: every profile + the new entry.
+SaveToChoices() {
+    choices := ProfileNamesSorted()
+    choices.Push("New empty profile...")
+    return choices
+}
+
+; Save to... confirmed: apply the choice. The "New empty profile..."
+; entry asks for a name first (validated like every other creation
+; path). The choice is read BEFORE Destroy (round-111 lesson).
+SaveToPicked(sd, ids, names, *) {
+    choice := sd["PProf"].Text
+    try sd.Destroy()
+    if (choice = "")
         return
-    pname := Trim(ib.Value)
-    if !ProfileNameOk(pname)
-        return
+    pname := choice
+    if (choice = "New empty profile...") {
+        ib := InputBox("Name for the new profile:", App.Name " - New Profile", "w400 h160")
+        if (ib.Result != "OK")
+            return
+        pname := Trim(ib.Value)
+        if !ProfileNameOk(pname)
+            return
+        if App.Profiles.Has(pname) {
+            MsgBox("A profile named '" pname "' already exists.", "Error", "Icon!")
+            return
+        }
+    }
     if !App.Profiles.Has(pname) {
         App.Profiles[pname] := Map()
         App.ProfileMacros[pname] := Map()
