@@ -190,6 +190,8 @@ InitApp() {
         UnregisterAllHotkeys()
         App.PixelWatchers := []
     }
+    ; * advanced: apply the restored profile's default Send mode
+    ApplyDefaultSendMode()
     BuildMainGui()
     ApplyTheme()
     InitRowIcons()
@@ -500,6 +502,8 @@ LoadSettings() {
     s["GuiVisible"] := 1
     s["StartSuspended"] := 0
     s["Autosave"] := 0
+    s["AdvancedMode"] := 0
+    s["SendMode"] := "Unspecified"   ; per-profile (Advanced mode only)
     s["DoStartup"] := FileExist(App.StartupLnk) ? 1 : 0   ; seeded, never persisted
     EnsureIniUtf16(App.IniFile)
     if FileExist(App.IniFile) {
@@ -512,6 +516,7 @@ LoadSettings() {
         s["GuiVisible"] := ReadIniInt("GuiVisible", 1, 0, 1)
         s["StartSuspended"] := ReadIniInt("StartSuspended", 0, 0, 1)
         s["Autosave"] := ReadIniInt("Autosave", 0, 0, 1)
+        s["AdvancedMode"] := ReadIniInt("AdvancedMode", 0, 0, 1)
     }
     ; ShellCmd is now a shell Id; "cmd" and "powershell" from older
     ; versions remain valid Ids. Reconcile against the detected list
@@ -543,6 +548,7 @@ SaveSettings() {
         IniWrite(App.Settings["GuiVisible"], App.IniFile, "SETTINGS", "GuiVisible")
         IniWrite(App.Settings["StartSuspended"], App.IniFile, "SETTINGS", "StartSuspended")
         IniWrite(App.Settings["Autosave"], App.IniFile, "SETTINGS", "Autosave")
+        IniWrite(App.Settings["AdvancedMode"], App.IniFile, "SETTINGS", "AdvancedMode")
     } catch as Err {
         LogError("settings write failed: " Err.Message)
     }
@@ -883,6 +889,14 @@ LoadConfig(file, &report, register := true) {
         }
         payload := StrReplace(payload, "{SEMICOLON}", ";")
         type := (section = "cmd") ? "cmd" : "key"
+        smode := ""
+        if (type = "key" && RegExMatch(payload, "\|SM:([A-Za-z]+)$", &smm)) {
+            ; * advanced: a trailing |SM:Mode on a remap action is its
+            ;   Send mode - ALWAYS parsed (the action stays clean) but
+            ;   only applied while Advanced mode is on
+            smode := SmValid(smm[1])
+            payload := SubStr(payload, 1, StrLen(payload) - StrLen(smm[0]))
+        }
         action := (type = "key") ? NormalizeAction(payload) : payload
         id := type "|" key "|" scope
         if curProfile.Has(id) {
@@ -892,7 +906,7 @@ LoadConfig(file, &report, register := true) {
         ; Seq preserves "later line wins" across restarts: the
         ; dispatcher picks the highest-Seq enabled binding per variant
         App.Seq++
-        curProfile[id] := Map("Type", type, "Key", key, "Scope", scope, "Action", action, "Enabled", enabled, "Icp", icp, "Seq", App.Seq)
+        curProfile[id] := Map("Type", type, "Key", key, "Scope", scope, "Action", action, "Enabled", enabled, "Icp", icp, "SendMode", smode, "Seq", App.Seq)
     }
     ; commit: replace all profiles, one register pass, one refresh
     UnregisterAllHotkeys()
@@ -986,8 +1000,10 @@ BuildConfigText() {
     if !App.ProfileSettings.Has(App.ActiveProfile)
         App.ProfileSettings[App.ActiveProfile] := Map()
     ps := App.ProfileSettings[App.ActiveProfile]
-    for , k in ["DoRepeatOutputs", "RepeatBuffer", "RepeatDelay"]
+    for , k in ["DoRepeatOutputs", "RepeatBuffer", "RepeatDelay", "ShellCmd", "ShellHidden"]
         ps[k] := App.Settings[k]
+    if (App.Settings["AdvancedMode"])
+        ps["SendMode"] := App.Settings["SendMode"]
     ; * The Default profile is written FIRST, explicitly by name, so
     ;   the output never depends on Map enumeration order (AHK Maps
     ;   keep insertion order, Keysharp's are sorted before enumeration).
@@ -1039,7 +1055,11 @@ ProfileSectionText(name, profile) {
 ;   grammar's one hard separator.
 FormatBindingLine(b) {
     keyText := (b["Enabled"] ? "" : "*") . b["Key"] . BindingIcp(b) . (b["Scope"] != "" ? "[" b["Scope"] "]" : "")
-    return keyText ";" StrReplace(b["Action"], ";", "{SEMICOLON}")
+    act := StrReplace(b["Action"], ";", "{SEMICOLON}")
+    ; * per-remap Send mode: trailing |SM:Mode marker on the action
+    if (b["Type"] = "key" && BindingSendMode(b) != "")
+        act .= "|SM:" BindingSendMode(b)
+    return keyText ";" act
 }
 
 ; --- Load / Save / Import / Export button + tray flows ---
@@ -1248,7 +1268,7 @@ HkVariantName(key, icp) {
 ; variant exists. The variant's On/Off state is reconciled from the
 ; bindings, and the criterion is set explicitly and reset after
 ; (facts 3f thread gotcha).
-RegHotkey(type, keyText, scope, action, enabled, icp := "") {
+RegHotkey(type, keyText, scope, action, enabled, icp := "", sendMode := "") {
     ; The trigger may be a hotkey, "hs:..." (hotstring) or "px:..."
     ; (pixel watch) - the last two skip the hotkey grammar.
     key := ""
@@ -1271,6 +1291,7 @@ RegHotkey(type, keyText, scope, action, enabled, icp := "") {
     b["Action"] := action
     b["Enabled"] := enabled ? true : false
     b["Icp"] := icp
+    b["SendMode"] := sendMode
     App.Seq++
     b["Seq"] := App.Seq
     if (SubStr(key, 1, 3) = "hs:") {
@@ -1426,6 +1447,11 @@ EffectiveBindingId(key, scope) {
 ; Interception type of a binding ("" for legacy maps without the field).
 BindingIcp(b) {
     return (IsObject(b) && b.Has("Icp")) ? b["Icp"] : ""
+}
+
+; Per-remap Send mode ("" when absent or Advanced mode never used).
+BindingSendMode(b) {
+    return (IsObject(b) && b.Has("SendMode")) ? b["SendMode"] : ""
 }
 
 ; Effective interception type = the effective ("later wins") binding's.
@@ -1685,6 +1711,8 @@ BindKey(id, *) {
         hdr := ParseMacroHeader(action)
         if (hdr.Mode = "release" || hdr.Mode = "pixel")
             return   ; release fires via BindKeyUp; pixel via the watcher
+        ; * advanced: the remap's Send mode wraps the whole macro
+        smPrev := ApplySendMode(BindingSendMode(b))
         RunMacroSequence(action)
         if (hdr.Mode = "repeat") {
             if (hdr.Buf != 0)
@@ -1696,12 +1724,16 @@ BindKey(id, *) {
                     Sleep(hdr.Del)
             }
         }
+        RestoreSendMode(smPrev)
         return
     }
+    ; * advanced: the remap's Send mode wraps the output
+    smPrev := ApplySendMode(BindingSendMode(b))
     sendStr := BuildKeyOutput(action)
     try Send(sendStr)
     catch as Err {
         LogError("send failed (" action "): " Err.Message)
+        RestoreSendMode(smPrev)
         return
     }
     if (App.Settings["DoRepeatOutputs"]) {
@@ -1720,6 +1752,7 @@ BindKey(id, *) {
             LogError("repeat failed (" action "): " Err.Message)
         }
     }
+    RestoreSendMode(smPrev)
 }
 
 ; F1 global toggle + Del / Ctrl+Z scoped to the main window.
@@ -2039,6 +2072,19 @@ BuildMainGui() {
         , App.Settings["Autosave"] ? "Disable" : "Enable")
     App.Ui["AutosaveBtn"].OnEvent("Click", ToggleAutosave)
 
+    row9 := row8 + rowH
+    g.Add("Text", "x(contentX+10) y" (contentY+36+row9) " w" lblW " h24 +BackgroundTrans", "Advanced mode (Send modes and advanced output options)")
+    App.Ui["AdvBtn"] := g.Add("Button", "x(contentX+350) y" (contentY+36+row9-2) " w100 h28" BtnBg()
+        , App.Settings["AdvancedMode"] ? "Disable" : "Enable")
+    App.Ui["AdvBtn"].OnEvent("Click", ToggleAdvancedMode)
+
+    row10 := row9 + rowH
+    App.Ui["SendModeLbl"] := g.Add("Text", "x(contentX+10) y" (contentY+36+row10) " w" lblW " h24 +BackgroundTrans", "Default Send mode (advanced, per profile)")
+    App.Ui["SendModeDDL"] := g.Add("DDL", "x(contentX+350) y" (contentY+36+row10-2) " w150 Choose" SmLabelIndex(App.Settings["SendMode"]), SmLabels())
+    App.Ui["SendModeDDL"].OnEvent("Change", OnSendModeChange)
+    App.Ui["SendModeLbl"].Visible := App.Settings["AdvancedMode"]
+    App.Ui["SendModeDDL"].Visible := App.Settings["AdvancedMode"]
+
 
     ; -- Tab 7: Usage Guide - split into INNER sub-tabs (user request:
     ;    the single scrolling stack overflowed the window) --
@@ -2058,13 +2104,13 @@ BuildMainGui() {
     guide.UseTab(3)
     App.Ui["GuideTxts"].Push(g.Add("Text", "x(contentX+10) y(contentY+36+10) w" gw " h" (tabH - 76) " +BackgroundTrans -Wrap", "COMMAND PREFIXES (Command Mapper actions)`n- &command  runs through the shell selected in Settings, hidden or visible per the console setting`n- Bash commands are syntax-checked (bash -n) before running`n- >text  sends text/keys instead of running a program`n- @code  runs AutoHotkey code via a temporary .ahk file (not available in compiled builds)`n- Doubled prefix (&&, >>, @@) passes the character through to the default handler`n- No prefix: hidden cmd.exe (Windows) / selected shell (Keysharp)`n`nSHELLS`n- The Settings tab selects the shell for & commands (cmd.exe or PowerShell on Windows; on Linux/macOS the list is discovered from the system)`n- bash is validated with bash -n before every run - syntax errors are reported and the command is NOT executed`n- rw: runs a command and WAITS for it to finish before the next macro action; run: proceeds immediately`n`nKEY REMAP REPEAT`n- !Tab 2 = press Tab twice with Alt held`n- Repeat-while-held: the Settings tab toggles whether holding the trigger key keeps repeating the output, with buffer/delay values (per-profile)"))
     guide.UseTab(4)
-    App.Ui["GuideTxts"].Push(g.Add("Text", "x(contentX+10) y(contentY+36+10) w" gw " h" (tabH - 76) " +BackgroundTrans -Wrap", "MACROS`n- A macro is a reusable Send sequence stored in the macro library (Macros tab)`n- Bindings reference macros by name: a Key Remap output of macro:Name replays it`n- Editing a macro instantly updates every binding that uses it`n`nTHE BUILDER (Builder... button)`n- Build macros one action at a time: Key press (with hold duration), Key down, Key up, Wait (ms), Run command (with wait-until-return), Mouse move (X/Y, relative, hold a key while moving), Sequence (raw Send string)`n- Loop start / Loop end wrap a part of the sequence; loops need unique names`n- Endloop must match the innermost open loop, every loop must be closed before saving`n- Test run executes the current sequence once`n`nTRIGGER MODES (per macro)`n- On key press: fires when the assigned key goes down`n- On key release: fires when the assigned key goes up`n- Repeat while held: repeats with per-macro buffer/delay`n- Pixel watch: fires while the pixel at X,Y turns to / turns from a color; the watcher polls while ReBindX runs`n- Pixel capture may be unavailable on some compositors (watcher disables itself and logs once)`n`nMACRO GRAMMAR (stored per profile)`n- trg:press|release|repeat  trigger mode`n- rbuf:ms / rdel:ms  repeat buffer/delay`n- px:x,y,RRGGBB,to|from  pixel trigger`n- kd:Key / ku:Key / kp:Key[:holdMs]  key actions`n- w:ms  wait`n- run:cmd / rw:cmd  shell (async / wait)`n- mm:x,y,rel|abs[,hold:Key]  mouse move`n- loop:Name:Count ... endloop:Name  repetition`n- sq:string  raw Send sequence`n- A literal | inside a parameter is stored as {PIPE}"))
+    App.Ui["GuideTxts"].Push(g.Add("Text", "x(contentX+10) y(contentY+36+10) w" gw " h" (tabH - 76) " +BackgroundTrans -Wrap", "MACROS`n- A macro is a reusable Send sequence stored in the macro library (Macros tab)`n- Bindings reference macros by name: a Key Remap output of macro:Name replays it`n- Editing a macro instantly updates every binding that uses it`n`nTHE BUILDER (Builder... button)`n- Build macros one action at a time: Key press (with hold duration), Key down, Key up, Wait (ms), Run command (with wait-until-return), Mouse move (X/Y, relative, hold a key while moving), Sequence (raw Send string)`n- Loop start / Loop end wrap a part of the sequence; loops need unique names`n- Endloop must match the innermost open loop, every loop must be closed before saving`n- Test run executes the current sequence once`n`nTRIGGER MODES (per macro)`n- On key press: fires when the assigned key goes down`n- On key release: fires when the assigned key goes up`n- Repeat while held: repeats with per-macro buffer/delay`n- Pixel watch: fires while the pixel at X,Y turns to / turns from a color; the watcher polls while ReBindX runs`n- Pixel capture may be unavailable on some compositors (watcher disables itself and logs once)`n`nMACRO GRAMMAR (stored per profile)`n- trg:press|release|repeat  trigger mode`n- rbuf:ms / rdel:ms  repeat buffer/delay`n- px:x,y,RRGGBB,to|from  pixel trigger`n- kd:Key / ku:Key / kp:Key[:holdMs]  key actions`n- w:ms  wait`n- run:cmd / rw:cmd  shell (async / wait)`n- mm:x,y,rel|abs[,hold:Key]  mouse move`n- loop:Name:Count ... endloop:Name  repetition`n- sq:string  raw Send sequence`n- snd:string  full AHK Send() syntax ({Raw}/{Blind}/{Text}, {VK}/{SC}/{U+}/{ASC nnnnn}, DownR/DownTemp)`n- A literal | inside a parameter is stored as {PIPE}"))
     guide.UseTab(5)
-    App.Ui["GuideTxts"].Push(g.Add("Text", "x(contentX+10) y(contentY+36+10) w" gw " h" (tabH - 76) " +BackgroundTrans -Wrap", "HOTSTRINGS`n- A hotstring fires when you TYPE its trigger text anywhere, then an ending character (space, Enter, etc.)`n- Set the Trigger type to Hotstring in the binding editor and type the trigger text`n- Replacement actions follow the binding grammar: >text sends text/keys, no prefix runs a command, & runs via the selected shell, macro:Name replays a library macro`n- The Hotstrings tab lists every hotstring binding with New/Edit/Delete/Toggle`n- Scope works for hotstrings too: [wintitle] limits where the text triggers`n`nPIXEL TRIGGERS`n- Trigger type Pixel: the binding fires when the screen pixel at X,Y turns to (or turns from) a color RRGGBB`n- Polls continuously while ReBindX runs; fires once per transition and re-arms when the color clears`n- A pixel watcher disables itself (with one log entry) on platforms where pixel capture is unavailable`n`nHOTKEY TRIGGERS`n- The classic form: a hotkey (e.g. #^G) fires the action on key press`n- Multiple bindings may share a hotkey: the LATEST enabled binding wins`n- Per-app scoping via [wintitle]`n- Interception (editor dropdown): ~ passthrough, $ force hook, * wildcard; combinable, stored as a key suffix (B~$)"))
+    App.Ui["GuideTxts"].Push(g.Add("Text", "x(contentX+10) y(contentY+36+10) w" gw " h" (tabH - 76) " +BackgroundTrans -Wrap", "HOTSTRINGS`n- A hotstring fires when you TYPE its trigger text anywhere, then an ending character (space, Enter, etc.)`n- Set the Trigger type to Hotstring in the binding editor and type the trigger text`n- Replacement actions follow the binding grammar: >text sends text/keys, no prefix runs a command, & runs via the selected shell, macro:Name replays a library macro`n- The Hotstrings tab lists every hotstring binding with New/Edit/Delete/Toggle`n- Scope works for hotstrings too: [wintitle] limits where the text triggers`n`nPIXEL TRIGGERS`n- Trigger type Pixel: the binding fires when the screen pixel at X,Y turns to (or turns from) a color RRGGBB`n- Polls continuously while ReBindX runs; fires once per transition and re-arms when the color clears`n- A pixel watcher disables itself (with one log entry) on platforms where pixel capture is unavailable`n`nHOTKEY TRIGGERS`n- The classic form: a hotkey (e.g. #^G) fires the action on key press`n- Multiple bindings may share a hotkey: the LATEST enabled binding wins`n- Per-app scoping via [wintitle]`n- Interception (editor dropdown): ~ passthrough, $ force hook, * wildcard; combinable - the keybind field shows the prefix (~#F), the cfg stores it as a suffix (B~$)"))
     guide.UseTab(6)
     App.Ui["GuideTxts"].Push(g.Add("Text", "x(contentX+10) y(contentY+36+10) w" gw " h" (tabH - 76) " +BackgroundTrans -Wrap", "PROFILES`n- A profile bundles bindings, macros AND the three repeat settings`n- Active profile: pick from the dropdown and press Switch (or use the tray menu)`n- New profile...: create from current settings, clone an existing profile, or start empty`n- Save: writes the active profile (one-time warning before saving into Default)`n- Save As...: copy the active profile under a new name and switch to it`n- Rename: type a new name for the ACTIVE profile (disabled for Default)`n- Export... / Import...: single-profile config files, merge-on-import`n- Delete / Clear: removes a non-Default profile (Default is cleared instead)`n- Save to... (sidebar): copies the SELECTED bindings/macros/hotstrings into any profile without switching`n`nSTORAGE`n- Profiles live as [Profile:Name] sections in keybinds.cfg`n- The Default profile is the headerless section at the top`n- macro:Name and set:Key lines inside a section carry its macros and settings`n- Undo (Ctrl+Z) covers profile operations"))
     guide.UseTab(7)
-    App.Ui["GuideTxts"].Push(g.Add("Text", "x(contentX+10) y(contentY+36+10) w" gw " h" (tabH - 76) " +BackgroundTrans -Wrap", "USING THE WINDOW`n- F1 hides/shows this window (rebindable)`n- Click a row to select; Ctrl+click or Shift+click selects several`n- Double-click a row, or press Enter, to edit; Del deletes the selected rows`n- Right-click a row to toggle/edit/delete that one binding`n- Ctrl+Z undoes the last change (10 levels)`n- The Filter box above each list narrows rows as you type`n- Resize the window freely; the lists follow (the Usage Guide content sets the lower limit)`n`nSETTINGS TAB`n- Repeat outputs/buffer/delay: per-profile remap repeat behavior`n- Run at startup: creates the Startup shortcut (Windows, admin)`n- Shell for & commands + console visibility`n- Start as suspended and Autosave: trigger/persistence defaults`n`nFILES`n- keybinds.cfg: bindings, remaps, macros, profiles (UTF-8)`n- rebindxsettings.ini: settings (UTF-16 on Windows/Win32; do not resave as UTF-8)`n- theme.cfg: optional colors; Auto=1 follows Windows dark/light mode`n- errors: error.log inside the ReBindX folder of the OS application-data directory`n- icons\gear.ico / keyboard.ico: list icons (missing icons degrade silently)"))
+    App.Ui["GuideTxts"].Push(g.Add("Text", "x(contentX+10) y(contentY+36+10) w" gw " h" (tabH - 76) " +BackgroundTrans -Wrap", "USING THE WINDOW`n- F1 hides/shows this window (rebindable)`n- Click a row to select; Ctrl+click or Shift+click selects several`n- Double-click a row, or press Enter, to edit; Del deletes the selected rows`n- Right-click a row to toggle/edit/delete that one binding`n- Ctrl+Z undoes the last change (10 levels)`n- The Filter box above each list narrows rows as you type`n- Resize the window freely; the lists follow (the Usage Guide content sets the lower limit)`n`nSETTINGS TAB`n- Repeat outputs/buffer/delay: per-profile remap repeat behavior`n- Run at startup: creates the Startup shortcut (Windows, admin)`n- Shell for & commands + console visibility`n- Start as suspended and Autosave: trigger/persistence defaults`n- Advanced mode + default Send mode (advanced settings live per profile)`n`nFILES`n- keybinds.cfg: bindings, remaps, macros, profiles (UTF-8)`n- rebindxsettings.ini: settings (UTF-16 on Windows/Win32; do not resave as UTF-8)`n- theme.cfg: optional colors; Auto=1 follows Windows dark/light mode`n- errors: error.log inside the ReBindX folder of the OS application-data directory`n- icons\gear.ico / keyboard.ico: list icons (missing icons degrade silently)"))
     guide.UseTab()
     SetUIThemeFont(g, "s10 c" App.Theme["Text"])
 
@@ -2449,12 +2495,14 @@ OnShellDDLChange(ctrl, *) {
     idx := ctrl.Value
     if (idx >= 1 && idx <= App.Shells.Length)
         App.Settings["ShellCmd"] := App.Shells[idx]["Id"]
+    SyncProfileSetting("ShellCmd")   ; shells are per-profile now
     SetStatus("Shell for & commands: " ctrl.Text)
 }
 
 ; Console visibility flip for & commands (Hidden/Visible face).
 ToggleShellVis(*) {
     App.Settings["ShellHidden"] := App.Settings["ShellHidden"] ? 0 : 1
+    SyncProfileSetting("ShellHidden")   ; per-profile now
     if App.Ui.Has("ShellVisBtn")
         App.Ui["ShellVisBtn"].Text := App.Settings["ShellHidden"] ? "Hidden" : "Visible"
     SetStatus("& commands will run " (App.Settings["ShellHidden"] ? "hidden" : "visible"))
@@ -2509,6 +2557,68 @@ ToggleAutosave(*) {
     if (App.Settings["Autosave"] && App.IsDirty)
         SetTimer(AutosaveFire, -500)
     SetStatus(App.Settings["Autosave"] ? "Autosave: on" : "Autosave: off")
+}
+
+; Settings row 9: reveal/hide the advanced settings (INI-persisted).
+; * ON re-reads the profile's advanced settings immediately (they
+;   were skipped while the mode was off); OFF resets the Send mode
+;   to the engine default (Input).
+ToggleAdvancedMode(*) {
+    App.Settings["AdvancedMode"] := App.Settings["AdvancedMode"] ? 0 : 1
+    SaveSettings()
+    adv := App.Settings["AdvancedMode"]
+    if App.Ui.Has("AdvBtn")
+        App.Ui["AdvBtn"].Text := adv ? "Disable" : "Enable"
+    if App.Ui.Has("SendModeLbl")
+        App.Ui["SendModeLbl"].Visible := adv
+    if App.Ui.Has("SendModeDDL")
+        App.Ui["SendModeDDL"].Visible := adv
+    if (adv) {
+        SetProfileView(App.ActiveProfile)
+        ApplyDefaultSendMode()
+        RefreshSettingsWidgets()
+        SetStatus("Advanced mode: on")
+    } else {
+        try SendMode("Input")
+        SetStatus("Advanced mode: off")
+    }
+}
+
+; Default Send mode DDL (advanced): per-profile via write-through.
+OnSendModeChange(ctrl, *) {
+    App.Settings["SendMode"] := ctrl.Text
+    SyncProfileSetting("SendMode")
+    ApplyDefaultSendMode()
+    SetStatus("Default Send mode: " ctrl.Text)
+}
+
+; * Re-sync the Settings tab widgets with App.Settings - needed on
+;   profile switches now that shell, console and Send mode are
+;   per-profile. Choose() re-fires the Change handlers with the
+;   same values (idempotent write-through).
+RefreshSettingsWidgets() {
+    if !App.Ui.Has("ShellDDL")
+        return
+    try {
+        idx := 1
+        for i, sh in App.Shells {
+            if (sh["Id"] = App.Settings["ShellCmd"])
+                idx := i
+        }
+        App.Ui["ShellDDL"].Choose(idx)
+        if App.Ui.Has("ShellVisBtn")
+            App.Ui["ShellVisBtn"].Text := App.Settings["ShellHidden"] ? "Hidden" : "Visible"
+        if App.Ui.Has("RepeatBtn")
+            App.Ui["RepeatBtn"].Text := App.Settings["DoRepeatOutputs"] ? "Disable" : "Enable"
+        if App.Ui.Has("RepeatBufUD")
+            App.Ui["RepeatBufUD"].Value := App.Settings["RepeatBuffer"]
+        if App.Ui.Has("RepeatDelayUD")
+            App.Ui["RepeatDelayUD"].Value := App.Settings["RepeatDelay"]
+        if App.Ui.Has("SendModeDDL")
+            App.Ui["SendModeDDL"].Choose(SmLabelIndex(App.Settings["SendMode"]))
+    } catch as Err {
+        LogError("settings refresh: " Err.Message)
+    }
 }
 
 ; Profiles tab Switch button: apply the DDL selection ("" = no-op).
@@ -2729,7 +2839,7 @@ IcpLabels() {
 
 ; Label -> the ~$* symbol run it starts with ("" for Unspecified).
 IcpFromLabel(lbl) {
-    RegExMatch(lbl, "^[~$]*", &im)
+    RegExMatch(lbl, "^[~$*]*", &im)
     return im[0]
 }
 
@@ -2742,8 +2852,90 @@ IcpLabelIndex(icp) {
     return 1
 }
 
+; Split a leading ~$* interception run off a keybind text; the
+; remainder is returned through &key (no prefix -> the whole text).
+SplitIcpPrefix(s, &key) {
+    if RegExMatch(s, "^[~$*]+", &im) {
+        key := SubStr(s, StrLen(im[0]) + 1)
+        return im[0]
+    }
+    key := s
+    return ""
+}
+
+; * Send-mode labels (doc-verified on BOTH engines): "Unspecified" is
+;   NOT a settable SendMode value (v1-only) - it means "plain Send",
+;   i.e. never call SendMode (the engine default is Input).
+SmLabels() {
+    return ["Unspecified", "Input", "Event", "Play", "InputThenPlay"]
+}
+
+; "" for anything that is not a real mode (Unspecified included).
+SmValid(m) {
+    return (m = "Input" || m = "Event" || m = "Play" || m = "InputThenPlay") ? m : ""
+}
+
+; Mode -> dropdown index (1 = Unspecified for unknown values).
+SmLabelIndex(m) {
+    for i, lbl in SmLabels() {
+        if (lbl = m)
+            return i
+    }
+    return 1
+}
+
+; Split a trailing #SM:Mode (per-token Send mode) off a macro token
+; argument. Only ever appended to key-action tokens - a key argument
+; can never contain a natural "#SM:" run (keys are \w after modifiers).
+SplitTokenSendMode(&arg) {
+    if RegExMatch(arg, "#SM:([A-Za-z]+)$", &tmm) {
+        m := SmValid(tmm[1])
+        arg := SubStr(arg, 1, StrLen(arg) - StrLen(tmm[0]))
+        return m
+    }
+    return ""
+}
+
+; * Apply a Send mode for the next output (Advanced mode only).
+;   Returns the previous mode for RestoreSendMode - SendMode() itself
+;   reports it (doc-verified), so no shadow state is kept.
+ApplySendMode(m) {
+    if !App.Settings["AdvancedMode"]
+        return ""
+    m := SmValid(m)
+    if (m = "")
+        return ""
+    try {
+        return SendMode(m)
+    } catch as Err {
+        LogError("SendMode(" m "): " Err.Message)
+        return ""
+    }
+}
+
+; Restore the mode ApplySendMode returned ("" = nothing to restore).
+RestoreSendMode(prev) {
+    if (prev = "")
+        return
+    try SendMode(prev)
+    catch as Err {
+        LogError("SendMode(" prev "): " Err.Message)
+    }
+}
+
+; * Apply the profile's default Send mode app-wide (Advanced mode
+;   only; threads inherit it as their fresh default - doc-verified).
+ApplyDefaultSendMode() {
+    if !App.Settings["AdvancedMode"]
+        return
+    try SendMode(SmValid(App.Settings["SendMode"]) != "" ? SmValid(App.Settings["SendMode"]) : "Input")
+    catch as Err {
+        LogError("SendMode(default): " Err.Message)
+    }
+}
+
 OpenEditor(mode := "Add", id := "", prefill := 0) {
-    st := Map("Mode", mode, "OrigId", "", "Type", "cmd", "Key", "", "Action", "", "Scope", "", "Trig", "hk", "Icp", "")
+    st := Map("Mode", mode, "OrigId", "", "Type", "cmd", "Key", "", "Action", "", "Scope", "", "Trig", "hk", "Icp", "", "SendMode", "")
     if (mode = "Edit") {
         b := GetBinding(id)
         if IsObject(b) {
@@ -2753,6 +2945,7 @@ OpenEditor(mode := "Add", id := "", prefill := 0) {
             st["Action"] := b["Action"]
             st["Scope"] := b["Scope"]
             st["Icp"] := BindingIcp(b)
+            st["SendMode"] := BindingSendMode(b)
         } else {
             ; diagnostic (user report: edit mode opened empty) - if
             ; this appears in error.log, the row->id lookup failed
@@ -2775,67 +2968,88 @@ OpenEditor(mode := "Add", id := "", prefill := 0) {
     ed.BackColor := App.Theme["Background"]
     ed.SetFont("s10 c" App.Theme["Text"], "Segoe UI")
 
-    ed.Add("Text", "x16 y16 w66 h22", "Type:")
-    typeDDL := ed.Add("DDL", "x86 y14 w140 vType", ["Command", "Key Remap"])
+    ed.Add("Text", "x16 y18 w66 h22", "Type:")
+    typeDDL := ed.Add("DDL", "x86 y14 w200 vType", ["Command", "Key Remap"])
     typeDDL.OnEvent("Change", EditorTypeChange)
-    ; interception type (Hotkey triggers only): ~ / $ / * prefixes
-    ed.Add("Text", "x230 y16 w66 h22 vIcpLbl", "Intercept:")
-    icpDDL := ed.Add("DDL", "x300 y14 w150 vIcp Choose1", IcpLabels())
 
-    ed.Add("Text", "x16 y62 w66 h22 vKeyLbl", "Keybind:")
-    trigDDL := ed.Add("DDL", "x330 y60 w120 vTrig Choose1", ["Hotkey", "Hotstring", "Pixel"])
+    ed.Add("Text", "x16 y66 w66 h22 vKeyLbl", "Trigger:")
+    trigDDL := ed.Add("DDL", "x86 y60 w200 vTrig Choose1", ["Hotkey", "Hotstring", "Pixel"])
     trigDDL.OnEvent("Change", EditorTrigChange)
-    ed.Add("Edit", "x86 y60 w220 h22 vKeyEdit c" App.Theme["Text"] " +Background" App.Theme["Control"], st["Key"])
+    ed.Add("Text", "x16 y110 w66 h22 vKeyLb2", "Keybind:")
+    keyEdit := ed.Add("Edit", "x86 y104 w200 h22 vKeyEdit c" App.Theme["Text"] " +Background" App.Theme["Control"], st["Key"])
+    keyEdit.OnEvent("Change", EditorKeyEditChange)
+
+    ; interception type (Hotkey triggers only): ~ / $ / * prefixes.
+    ; * KeyEdit mirrors the dropdown's symbols (two-way sync)
+    ed.Add("Text", "x16 y156 w66 h22 vIcpLbl", "Intercept:")
+    icpDDL := ed.Add("DDL", "x86 y150 w200 vIcp Choose1", IcpLabels())
+    icpDDL.OnEvent("Change", EditorIcpChange)
+
+    ; per-remap Send mode (advanced): same row, right side
+    ed.Add("Text", "x300 y156 w84 h22 vSmLbl", "Send mode:")
+    ed.Add("DDL", "x390 y150 w130 vSm Choose1", SmLabels())
 
     ; key picker (feature 2): modifier checkboxes, then the category
     ; and key DDLs stacked VERTICALLY with labels. Spacious layout
     ; (user report: elements stacked over each other): every row gets
     ; a 46-48px pitch so even GTK's taller-than-declared combos
     ; (~30-32px) keep clear separation.
-    ed.Add("Text", "x16 y110 w66 h22 vPickerLbl", "Picker:")
-    ed.Add("CheckBox", "x86 y108 w56 h22 vModCtrl" BtnBg(), "Ctrl")
-    ed.Add("CheckBox", "x150 y108 w56 h22 vModAlt" BtnBg(), "Alt")
-    ed.Add("CheckBox", "x214 y108 w64 h22 vModShift" BtnBg(), "Shift")
-    ed.Add("CheckBox", "x288 y108 w56 h22 vModWin" BtnBg(), "Win")
+    ed.Add("Text", "x16 y204 w66 h22 vPickerLbl", "Modifiers:")
+    ed.Add("CheckBox", "x86 y202 w56 h22 vModCtrl" BtnBg(), "Ctrl")
+    ed.Add("CheckBox", "x150 y202 w56 h22 vModAlt" BtnBg(), "Alt")
+    ed.Add("CheckBox", "x214 y202 w64 h22 vModShift" BtnBg(), "Shift")
+    ed.Add("CheckBox", "x288 y202 w56 h22 vModWin" BtnBg(), "Win")
     for , cbName in ["ModCtrl", "ModAlt", "ModShift", "ModWin"]
         ed[cbName].OnEvent("Click", PickerChange)
 
-    ed.Add("Text", "x16 y158 w66 h22 vCatLbl", "Category:")
-    catDDL := ed.Add("DDL", "x86 y156 w200 vKeyCat", PickerCategoryNames())
+    ed.Add("Text", "x16 y252 w66 h22 vCatLbl", "Category:")
+    catDDL := ed.Add("DDL", "x86 y246 w200 vKeyCat", PickerCategoryNames())
     catDDL.OnEvent("Change", EditorCatChange)
     catDDL.Choose(1)
-    ed.Add("Text", "x16 y206 w66 h22 vKeyPickLbl", "Key:")
-    keyDDL := ed.Add("DDL", "x86 y204 w200 vKeyPick", PickerKeysForCategory("Letters"))
+    ed.Add("Text", "x16 y300 w66 h22 vKeyPickLbl", "Key:")
+    keyDDL := ed.Add("DDL", "x86 y294 w200 vKeyPick", PickerKeysForCategory("Letters"))
     keyDDL.OnEvent("Change", PickerChange)
 
     isCmd := (st["Type"] = "cmd")
-    ed.Add("Text", "x16 y254 w66 h22 vActionLabel", isCmd ? "Command:" : "Output key:")
-    actionOpts := isCmd ? "x86 y252 w320 h80 Multi vAction" : "x86 y252 w320 h22 vAction"
-    ed.Add("Edit", actionOpts " c" App.Theme["Text"] " +Background" App.Theme["Control"], st["Action"])
+    ed.Add("Text", "x16 y346 w400 h22 vActionLabel", isCmd ? "Command to execute:" : "Output key:")
+    ; * TWO action edits traded by mapping type (Multi h80 for
+    ;   commands, h22 single-line for remap outputs - both at the
+    ;   user-tuned y372): a created edit's Multi style cannot be
+    ;   toggled at runtime and Opt-based resizing proved unreliable,
+    ;   so the type switch trades visibility instead of mutating
+    ;   geometry (user report: the build-time height/position never
+    ;   followed the type switch).
+    ed.Add("Edit", "x86 y372 w320 h80 Multi vActionM c" App.Theme["Text"] " +Background" App.Theme["Control"], st["Action"])
+    ed.Add("Edit", "x86 y372 w320 h22 vActionS c" App.Theme["Text"] " +Background" App.Theme["Control"], st["Action"])
+    ed["ActionM"].Visible := isCmd
+    ed["ActionS"].Visible := !isCmd
 
-    ed.Add("Text", "x16 y366 w400 h22 vScopeLbl", "Window scope (optional) - e.g. ahk_exe chrome.exe")
-    ed.Add("Edit", "x86 y392 w320 h22 vScopeEdit c" App.Theme["Text"] " +Background" App.Theme["Control"], st["Scope"])
+    ed.Add("Text", "x16 y456 w400 h22 vScopeLbl", "Window scope (optional) - e.g. ahk_exe chrome.exe")
+    ed.Add("Edit", "x86 y482 w320 h22 vScopeEdit c" App.Theme["Text"] " +Background" App.Theme["Control"], st["Scope"])
 
-    ; Pixel trigger fields (visible when Trigger = Pixel)
-    ed.Add("Text", "x16 y366 w60 h22 vPXT", "Pixel X:")
-    ed.Add("Edit", "x80 y364 w60 h22 vPX c" App.Theme["Text"] " +Background" App.Theme["Control"], 0)
-    ed.Add("Text", "x150 y366 w20 h22 vPYT", "Y:")
-    ed.Add("Edit", "x176 y364 w60 h22 vPY c" App.Theme["Text"] " +Background" App.Theme["Control"], 0)
-    ed.Add("Text", "x244 y366 w44 h22 vPCT", "Color:")
-    ed.Add("Edit", "x292 y364 w70 h22 vPC c" App.Theme["Text"] " +Background" App.Theme["Control"], "FFFFFF")
-    ed.Add("DDL", "x370 y364 w80 vPM Choose1", ["to", "from"])
-    testBtn := ed.Add("Button", "x235 y440 w90 h28" BtnBg(), "Test")
+    ; Pixel trigger fields (visible when Trigger = Pixel) - they trade
+    ; places with the Keybind/Intercept rows
+    ed.Add("Text", "x16 y110 w60 h22 vPXT", "Pixel X:")
+    ed.Add("Edit", "x86 y104 w60 h22 vPX c" App.Theme["Text"] " +Background" App.Theme["Control"], 0)
+    ed.Add("Text", "x156 y110 w20 h22 vPYT", "Y:")
+    ed.Add("Edit", "x182 y104 w60 h22 vPY c" App.Theme["Text"] " +Background" App.Theme["Control"], 0)
+    ed.Add("Text", "x250 y110 w44 h22 vPCT", "Color:")
+    ed.Add("Edit", "x298 y104 w70 h22 vPC c" App.Theme["Text"] " +Background" App.Theme["Control"], "FFFFFF")
+    ed.Add("Text", "x16 y156 w60 h22 vPA", "Action:")
+    ed.Add("DDL", "x86 y152 w80 vPM Choose1", ["changes to", "changes from"])
+
+    testBtn := ed.Add("Button", "x235 y530 w90 h28" BtnBg(), "Test")
     testBtn.OnEvent("Click", TestRemap)
-    saveBtn := ed.Add("Button", "x335 y440 w90 h28" BtnBg(), "Save")
+    saveBtn := ed.Add("Button", "x335 y530 w90 h28" BtnBg(), "Save")
     saveBtn.OnEvent("Click", EditorSave.Bind(st))
-    cancelBtn := ed.Add("Button", "x435 y440 w90 h28" BtnBg(), "Cancel")
+    cancelBtn := ed.Add("Button", "x435 y530 w90 h28" BtnBg(), "Cancel")
     cancelBtn.OnEvent("Click", (*) => ed.Destroy())
 
     typeDDL.Choose(isCmd ? 1 : 2)
     ; Explicit .Value prefill AFTER creation: the Add()-third-parameter
     ; initial text proved unreliable under GTK (user report: Edit mode
     ; opened empty and Save demanded the key be retyped).
-    ed["Action"].Value := st["Action"]
+    EditorActionSet(ed, st["Action"])
     ed["ScopeEdit"].Value := st["Scope"]
     trigIdx := 1
     dispKey := st["Key"]
@@ -2850,11 +3064,12 @@ OpenEditor(mode := "Add", id := "", prefill := 0) {
         trigIdx := 2
     ed["Trig"].Choose(trigIdx)
     ed["Icp"].Choose(IcpLabelIndex(st["Icp"]))
-    ed["KeyEdit"].Value := dispKey
+    ed["Sm"].Choose(SmLabelIndex(st["SendMode"]))
+    ed["KeyEdit"].Value := (trigIdx = 1 ? st["Icp"] : "") . dispKey
     EditorTrigChange(ed["Trig"])
     if (trigIdx = 1 && st["Key"] != "")
         SyncPickerFromKey(ed, st["Key"])
-    ed.Show("w535 h490")
+    ed.Show("w535 h582")
 }
 
 ; Trigger-type switch: the Keybind label text and the key picker
@@ -2864,15 +3079,31 @@ EditorTrigChange(ctrl, *) {
     g := ctrl.Gui
     trig := ctrl.Text
     hk := (trig = "Hotkey")
-    try g["KeyLbl"].Text := hk ? "Keybind:" : (trig = "Hotstring") ? "Hotstring:" : "Pixel:"
+    try g["KeyLb2"].Text := hk ? "Keybind:" : (trig = "Hotstring") ? "Hotstring:" : "Pixel:"
     for , n in ["PickerLbl", "ModCtrl", "ModAlt", "ModShift", "ModWin", "CatLbl", "KeyCat", "KeyPickLbl", "KeyPick", "IcpLbl", "Icp"]
         try g[n].Visible := hk
     px := (trig = "Pixel")
     ; the pixel fields and the scope row trade places
-    for , n in ["PXT", "PX", "PYT", "PY", "PCT", "PC", "PM"]
+    for , n in ["PXT", "PX", "PYT", "PY", "PCT", "PC", "PM", "PA"]
         try g[n].Visible := px
+    try g["KeyLb2"].Visible := !px
+    try g["KeyEdit"].Visible := !px
     try g["ScopeLbl"].Visible := !px
     try g["ScopeEdit"].Visible := !px
+    ; * per-remap Send mode (advanced): Key Remap + Hotkey + advanced
+    try {
+        advSm := App.Settings["AdvancedMode"] && hk && (g["Type"].Text = "Key Remap")
+        g["SmLbl"].Visible := advSm
+        g["Sm"].Visible := advSm
+    }
+    ; * KeyEdit mirrors the Intercept dropdown's ~$* prefix: keep it
+    ;   present on Hotkey triggers, stripped from the other kinds
+    try {
+        pfx := SplitIcpPrefix(g["KeyEdit"].Value, &kBase)
+        icpWant := hk ? IcpFromLabel(g["Icp"].Text) : ""
+        if (icpWant != pfx)
+            g["KeyEdit"].Value := icpWant kBase
+    }
     ; remember the user's trigger across Command <-> Key Remap switches
     if (!hk && trig != "Pixel")
         App.EditorLastTrig := "hs"
@@ -2880,14 +3111,46 @@ EditorTrigChange(ctrl, *) {
         App.EditorLastTrig := ""
 }
 
-; Type switch: relabel the action field and resize it (.Text only).
+; The ACTIVE action edit's text (the two edits trade by mapping
+; type; the active one follows the Type DDL).
+EditorActionGet(g) {
+    try {
+        if (g["Type"].Text = "Key Remap")
+            return g["ActionS"].Value
+        return g["ActionM"].Value
+    } catch as Err {
+        return ""
+    }
+}
+
+; Write the same text to BOTH action edits (they trade by type).
+EditorActionSet(g, txt) {
+    try {
+        g["ActionM"].Value := txt
+        g["ActionS"].Value := txt
+    } catch as Err {
+        LogError("action field: " Err.Message)
+    }
+}
+
+; Type switch: relabel the action row and TRADE the two action
+; edits (a true Multi for commands, a single-line for remap outputs).
 ; Type itself is derived from the DDL when saving, so no shared
 ; state is written here.
 EditorTypeChange(ctrl, *) {
     g := ctrl.Gui
-    if (ctrl.Text = "Key Remap") {
+    ; * carry the text from the OLD type's edit (the label still names
+    ;   the old type) - a same-type re-selection copies nothing
+    oldCmd := (g["ActionLabel"].Text = "Command to execute:")
+    newCmd := (ctrl.Text != "Key Remap")
+    if (newCmd && !oldCmd)
+        try g["ActionM"].Value := g["ActionS"].Value
+    else if (!newCmd && oldCmd)
+        try g["ActionS"].Value := g["ActionM"].Value
+    try g["ActionM"].Visible := newCmd
+    try g["ActionS"].Visible := !newCmd
+    if (!newCmd) {
         g["ActionLabel"].Text := "Output key:"
-        g["Action"].Opt("h22")
         g["Trig"].Choose(1)
         EditorTrigChange(g["Trig"])
     } else {
@@ -2895,9 +3158,30 @@ EditorTypeChange(ctrl, *) {
             g["Trig"].Choose(2)
             EditorTrigChange(g["Trig"])
         }
-        g["ActionLabel"].Text := "Command:"
-        g["Action"].Opt("h80")
+        g["ActionLabel"].Text := "Command to execute:"
     }
+}
+
+; Intercept dropdown change: mirror the ~$* symbols into KeyEdit
+; (a #F hotkey + Passthrough -> ~#F).
+EditorIcpChange(ctrl, *) {
+    g := ctrl.Gui
+    newIcp := IcpFromLabel(ctrl.Text)
+    pfx := SplitIcpPrefix(g["KeyEdit"].Value, &kBase)
+    if (newIcp != pfx)
+        g["KeyEdit"].Value := newIcp kBase
+}
+
+; KeyEdit typing: a leading ~$* run moves the Intercept dropdown
+; (only for Hotkey triggers - the stored choice of the other
+; trigger kinds stays untouched).
+EditorKeyEditChange(ctrl, *) {
+    g := ctrl.Gui
+    if (g["Trig"].Text != "Hotkey")
+        return
+    pfx := SplitIcpPrefix(ctrl.Value, &kBase)
+    if (pfx != IcpFromLabel(g["Icp"].Text))
+        g["Icp"].Choose(IcpLabelIndex(pfx))
 }
 
 ; Category DDL change: refill the key DDL and re-compose the keybind.
@@ -2926,7 +3210,7 @@ ComposePickerKey(ed) {
         keyName := ed["KeyPick"].Text
         if (keyName = "")
             return
-        ed["KeyEdit"].Value := mods keyName
+        ed["KeyEdit"].Value := IcpFromLabel(ed["Icp"].Text) mods keyName
     } catch as Err {
         LogError("picker compose: " Err.Message)
     }
@@ -2937,6 +3221,7 @@ ComposePickerKey(ed) {
 ; showed the key text but the picker stayed unselected).
 SyncPickerFromKey(ed, keyText) {
     try {
+        SplitIcpPrefix(keyText, &keyText)   ; strip any ~$* interception prefix
         ed["ModCtrl"].Value := InStr(keyText, "^") ? 1 : 0
         ed["ModAlt"].Value := InStr(keyText, "!") ? 1 : 0
         ed["ModShift"].Value := InStr(keyText, "+") ? 1 : 0
@@ -3031,7 +3316,9 @@ TestRemap(ctrl, *) {
     trig := g["Trig"].Text
     key := ""
     if (trig = "Hotkey") {
-        key := NormalizeKey(g["KeyEdit"].Value)
+        keyTxt := g["KeyEdit"].Value
+        SplitIcpPrefix(keyTxt, &keyBase)
+        key := NormalizeKey(keyBase)
         if (key = "") {
             MsgBox("Invalid key format.", "Error", "Icon!")
             return
@@ -3065,7 +3352,7 @@ TestRemap(ctrl, *) {
         }
         key := "px:" Integer(pxX) "," Integer(pxY) "," pxC "," pxM
     }
-    action := Trim(g["Action"].Value)
+    action := Trim(EditorActionGet(g))
     if (action = "")
         return
     isCmd := (g["Type"].Text != "Key Remap")
@@ -3100,12 +3387,13 @@ EditorSave(st, ctrl, *) {
     key := ""
     icp := ""
     if (trig = "Hotkey") {
-        key := NormalizeKey(g["KeyEdit"].Value)
+        keyTxt := g["KeyEdit"].Value
+        icp := SplitIcpPrefix(keyTxt, &keyBase)
+        key := NormalizeKey(keyBase)
         if (key = "") {
             MsgBox("Invalid key format.", "Error", "Icon!")
             return
         }
-        icp := IcpFromLabel(g["Icp"].Text)
     } else if (trig = "Hotstring") {
         hsTxt := RegExReplace(Trim(g["KeyEdit"].Value), "i)^hs:")
         ; ; and | cannot survive the cfg grammar, [ and ] would be
@@ -3135,7 +3423,7 @@ EditorSave(st, ctrl, *) {
         }
         key := "px:" Integer(pxX) "," Integer(pxY) "," pxC "," pxM
     }
-    action := Trim(g["Action"].Value)
+    action := Trim(EditorActionGet(g))
     if (action = "") {
         MsgBox("Action cannot be empty.", "Error", "Icon!")
         return
@@ -3178,7 +3466,10 @@ EditorSave(st, ctrl, *) {
         if IsObject(ob)
             enabled := ob["Enabled"]
     }
-    RegHotkey(type, key, scope, action, enabled, icp)
+    sendMode := ""
+    if (type = "key" && App.Settings["AdvancedMode"])
+        sendMode := SmValid(g["Sm"].Text)
+    RegHotkey(type, key, scope, action, enabled, icp, sendMode)
     SetDirty()
     RefreshGuiData()
     g.Destroy()
@@ -3465,16 +3756,21 @@ ExecuteMacroToken(tok) {
     arg := StrReplace(SubStr(tok, c + 1), "{PIPE}", "|")
     switch op {
         case "kp":
-            ; kp:Key[:holdMs] - a hold duration inserts the wait
-            ; between the key-down and the key-up (user request)
+            ; kp:Key[:holdMs][#SM:Mode] - a hold duration inserts the
+            ; wait between the key-down and the key-up; * a trailing
+            ; #SM:Mode (advanced) wraps this token's send
+            tm := SplitTokenSendMode(&arg)
+            prev := ApplySendMode(tm)
             kp := StrSplit(tok, ":")
             if (kp.Length >= 3) {
-                holdMs := 0
-                try holdMs := Integer(kp[3])
+                kpv := kp[3]
+                SplitTokenSendMode(&kpv)
+                holdMs := SafeInt(kpv, 0)
                 if (holdMs > 0) {
                     Send("{" arg " down}")
                     Sleep(holdMs)
                     Send("{" arg " up}")
+                    RestoreSendMode(prev)
                     return
                 }
             }
@@ -3482,10 +3778,19 @@ ExecuteMacroToken(tok) {
                 Send(arg)
             else
                 Send("{" arg "}")
+            RestoreSendMode(prev)
         case "kd":
+            prev := ApplySendMode(SplitTokenSendMode(&arg))
             Send("{" arg " down}")
+            RestoreSendMode(prev)
         case "ku":
+            prev := ApplySendMode(SplitTokenSendMode(&arg))
             Send("{" arg " up}")
+            RestoreSendMode(prev)
+        case "snd":
+            ; AHK Send: any Send()-compliant string - {Raw}/{Blind}/{Text},
+            ; {VK}/{SC}/{U+}/{ASC nnnnn}, DownR/DownTemp, repeat counts
+            Send(arg)
         case "w":
             ms := SafeInt(arg, 0)   ; hand-edited token: "abcd" waits 0
             if (ms < 0)
@@ -3536,7 +3841,9 @@ BindKeyUp(id, *) {
         return
     if (ParseMacroHeader(action).Mode != "release")
         return
+    smPrev := ApplySendMode(BindingSendMode(b))
     RunMacroSequence(action)
+    RestoreSendMode(smPrev)
 }
 
 ; Dispatcher for the up-variant (parallel to BindingDispatch).
@@ -3741,14 +4048,28 @@ TokenDisplay(tok) {
     if (parts.Length >= 2)
         arg := StrReplace(parts[2], "{PIPE}", "|")
     switch op {
-        case "kp":
-            hold := (parts.Length >= 3) ? ("hold " parts[3] " ms") : ""
-            return ["Key press", arg, hold]
-        case "kd": return ["Key down", arg, ""]
-        case "ku": return ["Key up", arg, ""]
+        case "kp": {
+            SplitTokenSendMode(&arg)
+            hv := ""
+            if (parts.Length >= 3) {
+                hv := parts[3]
+                SplitTokenSendMode(&hv)
+                hv := "hold " hv " ms"
+            }
+            return ["Key press", arg, hv]
+        }
+        case "kd": {
+            SplitTokenSendMode(&arg)
+            return ["Key down", arg, ""]
+        }
+        case "ku": {
+            SplitTokenSendMode(&arg)
+            return ["Key up", arg, ""]
+        }
         case "w": return ["Wait", arg " ms", ""]
         case "run": return ["Run command", SubStr(arg, 1, 50), ""]
         case "sq": return ["Sequence", SubStr(arg, 1, 50), ""]
+        case "snd": return ["AHK Send", SubStr(arg, 1, 50), ""]
         case "rw": return ["Run command", SubStr(arg, 1, 50), "waits for return"]
         case "mm":
             p := StrSplit(StrReplace(SubStr(tok, 4), "{PIPE}", "|"), ",")
@@ -4167,6 +4488,8 @@ OpenActionDialog(rowIndex) {
         g["AMY"].Value := 0
         g["ARel"].Value := 0
         g["AHold"].Value := ""
+        g["AS"].Value := ""
+        g["ASm"].Choose(1)
         g["AType"].Choose(1)
         ActionDlgTypeChange(g["AType"])
     } else {
@@ -4190,7 +4513,7 @@ BuildActionDialog() {
     g.BackColor := App.Theme["Background"]
     ThemedFont(g, "s10 c" App.Theme["Text"])
     g.Add("Text", "x16 y22 w50 h22", "Type:")
-    tddl := g.Add("DDL", "x86 y20 w180 vAType Choose1", ["Key press", "Key down", "Key up", "Wait", "Run command", "Mouse move", "Sequence", "Loop start", "Loop end"])
+    tddl := g.Add("DDL", "x86 y20 w180 vAType Choose1", ["Key press", "Key down", "Key up", "Wait", "Run command", "Mouse move", "Sequence", "Loop start", "Loop end", "AHK Send"])
     tddl.OnEvent("Change", ActionDlgTypeChange)
     ; -- per-type field groups, all sharing the y56 row --
     g.Add("Text", "x16 y64 w40 h22 vLKey", "Key:")
@@ -4215,6 +4538,11 @@ BuildActionDialog() {
     g.Add("Edit", "x70 y62 w140 h22 vALoopName c" App.Theme["Text"] " +Background" App.Theme["Control"], "")
     g.Add("Text", "x230 y64 w50 h22 vLLoopCount", "Count:")
     g.Add("Edit", "x284 y62 w70 h22 vALoopCount c" App.Theme["Text"] " +Background" App.Theme["Control"], "")
+    ; * per-token Send mode (advanced, key actions) + AHK Send field
+    g.Add("Text", "x16 y104 w40 h22 vLSm", "Mode:")
+    g.Add("DDL", "x60 y102 w100 vASm Choose1", SmLabels())
+    g.Add("Text", "x16 y64 w70 h22 vLAS", "AHK Send:")
+    g.Add("Edit", "x90 y62 w360 h22 vAS c" App.Theme["Text"] " +Background" App.Theme["Control"], "")
     saveBtn := g.Add("Button", "x86 y148 w90 h28" BtnBg(), "Save")
     saveBtn.OnEvent("Click", ActionDialogSave)
     cancelBtn := g.Add("Button", "x196 y148 w90 h28" BtnBg(), "Cancel")
@@ -4236,6 +4564,8 @@ ActionDlgTypeChange(ctrl, *) {
     AShowVis(g, (typ = "Run command"), ["LCmd", "ACmd", "ARunWait"])
     AShowVis(g, (typ = "Mouse move"), ["LMX", "AMX", "LMY", "AMY", "ARel", "LAHold", "AHold"])
     AShowVis(g, (typ = "Sequence"), ["LSeq", "ASeq"])
+    AShowVis(g, (typ = "AHK Send"), ["LAS", "AS"])
+    AShowVis(g, App.Settings["AdvancedMode"] && k, ["LSm", "ASm"])
     AShowVis(g, (typ = "Loop start" || typ = "Loop end"), ["LLoopName", "ALoopName"])
     AShowVis(g, (typ = "Loop start"), ["LLoopCount", "ALoopCount"])
     ; per-type defaults (user request): loop end -> innermost open loop,
@@ -4296,6 +4626,9 @@ PrefillActionDialog(g, tok) {
     } else if (op = "sq") {
         which := 7
         g["ASeq"].Value := arg
+    } else if (op = "snd") {
+        which := 10
+        g["AS"].Value := arg
     } else if (op = "mm") {
         which := 6
         p := StrSplit(StrReplace(SubStr(tok, 4), "{PIPE}", "|"), ",")
@@ -4321,9 +4654,20 @@ PrefillActionDialog(g, tok) {
         g["ALoopName"].Value := (parts.Length >= 2) ? parts[2] : ""
     }
     if (which <= 3) {
+        ; * strip + capture a trailing #SM:Mode (it may sit on the key
+        ;   part or, with a hold, on the hold part)
+        tm := SplitTokenSendMode(&arg)
+        hv := ""
+        if (parts.Length >= 3) {
+            hv := parts[3]
+            tm2 := SplitTokenSendMode(&hv)
+            if (tm = "")
+                tm := tm2
+        }
         g["AKey"].Value := arg
-        if (op = "kp" && parts.Length >= 3)
-            g["AHoldMs"].Value := parts[3]
+        try g["ASm"].Choose(SmLabelIndex(tm))
+        if (op = "kp" && hv != "")
+            g["AHoldMs"].Value := hv
     }
     g["AType"].Choose(which)
     ActionDlgTypeChange(g["AType"])
@@ -4363,6 +4707,12 @@ ActionDialogSave(*) {
                 tok .= ":" hold
             }
         }
+        ; * per-token Send mode (advanced): stored in-line as #SM:Mode
+        if (App.Settings["AdvancedMode"]) {
+            tm := SmValid(g["ASm"].Text)
+            if (tm != "")
+                tok .= "#SM:" tm
+        }
     } else if (typ = "Wait") {
         w := Trim(g["AWait"].Value)
         ok := false
@@ -4389,6 +4739,13 @@ ActionDialogSave(*) {
             return
         }
         tok := "sq:" sq
+    } else if (typ = "AHK Send") {
+        s2 := Trim(g["AS"].Value)
+        if (s2 = "") {
+            MsgBox("The Send string cannot be empty.", "Error", "Icon!")
+            return
+        }
+        tok := "snd:" s2
     } else if (typ = "Mouse move") {
         mx := Trim(g["AMX"].Value)
         my := Trim(g["AMY"].Value)
@@ -4604,12 +4961,12 @@ SetProfileView(name) {
         App.ProfileSettings[name] := Map()
     App.MacroLib := App.ProfileMacros[name]
     ps := App.ProfileSettings[name]
-    for , k in ["DoRepeatOutputs", "RepeatBuffer", "RepeatDelay"] {
+    for , k in ["DoRepeatOutputs", "RepeatBuffer", "RepeatDelay", "ShellHidden"] {
         if ps.Has(k) {
             ; ! hand-edited set: lines can carry anything ("abcd", "-13");
             ;   sanitize before the values reach Sleep()/the UpDowns
             v := SafeInt(ps[k], -1)
-            if (k = "DoRepeatOutputs")
+            if (k = "DoRepeatOutputs" || k = "ShellHidden")
                 App.Settings[k] := (v = 1) ? 1 : 0
             else {
                 if (v < 0)
@@ -4622,6 +4979,27 @@ SetProfileView(name) {
             }
         } else
             ps[k] := App.Settings[k]
+    }
+    ; * the shell selection is PER-PROFILE: an unknown Id falls back to
+    ;   the first detected shell (LoadSettings' reconcile rule)
+    if ps.Has("ShellCmd") {
+        found := false
+        for , sh in App.Shells {
+            if (sh["Id"] = ps["ShellCmd"])
+                found := true
+        }
+        if (found)
+            App.Settings["ShellCmd"] := ps["ShellCmd"]
+    } else
+        ps["ShellCmd"] := App.Settings["ShellCmd"]
+    ; * SendMode is an ADVANCED profile setting: only loaded while
+    ;   Advanced mode is on; never touched (and never overwritten
+    ;   into the store) while it is off
+    if (App.Settings["AdvancedMode"]) {
+        if ps.Has("SendMode")
+            App.Settings["SendMode"] := SmValid(ps["SendMode"]) != "" ? ps["SendMode"] : "Unspecified"
+        else
+            ps["SendMode"] := App.Settings["SendMode"]
     }
 }
 
@@ -4939,8 +5317,13 @@ ProfileImport(*) {
                         continue
                     id := type "|" nk "|" scope
                 }
+                smode := ""
+                if (type = "key" && RegExMatch(payload, "\|SM:([A-Za-z]+)$", &smm2)) {
+                    smode := SmValid(smm2[1])
+                    payload := SubStr(payload, 1, StrLen(payload) - StrLen(smm2[0]))
+                }
                 act := (type = "key") ? NormalizeAction(payload) : payload
-                curP[id] := Map("Type", type, "Key", SubStr(id, InStr(id, "|") + 1, InStr(id, "|", false, InStr(id, "|") + 1) - InStr(id, "|") - 1), "Scope", scope, "Action", act, "Enabled", enabled, "Icp", icp, "Seq", ++App.Seq)
+                curP[id] := Map("Type", type, "Key", SubStr(id, InStr(id, "|") + 1, InStr(id, "|", false, InStr(id, "|") + 1) - InStr(id, "|") - 1), "Scope", scope, "Action", act, "Enabled", enabled, "Icp", icp, "SendMode", smode, "Seq", ++App.Seq)
                 added++
             }
         }
@@ -4997,8 +5380,10 @@ SyncProfileSettings() {
     if !App.ProfileSettings.Has(App.ActiveProfile)
         App.ProfileSettings[App.ActiveProfile] := Map()
     ps := App.ProfileSettings[App.ActiveProfile]
-    for , k in ["DoRepeatOutputs", "RepeatBuffer", "RepeatDelay"]
+    for , k in ["DoRepeatOutputs", "RepeatBuffer", "RepeatDelay", "ShellCmd", "ShellHidden"]
         ps[k] := App.Settings[k]
+    if (App.Settings["AdvancedMode"])
+        ps["SendMode"] := App.Settings["SendMode"]
 }
 
 ; Sidebar "Save to...": copy the SELECTED items (bindings / macros /
@@ -5199,8 +5584,9 @@ SwitchProfile(name) {
         App.Profiles[name] := Map()
     App.ActiveProfile := name
     App.Settings["ActiveProfile"] := name   ; persisted at next SaveSettings
-    SetProfileView(name)   ; macro/settings view + sanitized 3-setting sync
+    SetProfileView(name)   ; macro/settings view + sanitized settings sync
     FillProfilesTab()
+    RefreshSettingsWidgets()   ; shell/console/Send mode are per-profile
     RegisterAllHotkeys()
     RebuildProfilesMenu()
     RefreshGuiData()
