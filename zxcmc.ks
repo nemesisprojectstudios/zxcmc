@@ -44,7 +44,7 @@
 #SingleInstance Force
 #UseHook
 
-ProcessSetPriority("AboveNormal")
+try ProcessSetPriority("AboveNormal")
 SetWinDelay(-1)
 SetControlDelay(-1)
 
