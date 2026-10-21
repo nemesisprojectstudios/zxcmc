@@ -1,6 +1,8 @@
-# ReBindX
+# ZxCMC
 
-ReBindX is a keyboard remapper and command launcher for power users: bind any key combination to a shell command, to another key press, or to a recorded macro, optionally scoped to a single application window. It is a single, binary-free script with no installer and no runtime dependencies beyond the interpreter — written once in [AutoHotkey](https://www.autohotkey.com/) v2 syntax and shipped as two runnables: `rebindx.ahk` (AutoHotkey v2.0, Windows — the canonical implementation) and `rebindx.ks` (a mechanical mirror of the same code for [Keysharp](https://github.com/keysharp-org/Keysharp), the cross-platform .NET port, covering Windows/Linux/macOS). All bindings live in one plain-text file, `keybinds.cfg`, next to the script, and every feature is also reachable from a borderless GUI and a tray menu.
+**Zx's Crossplatform Macro Client** - cross-platform hotkey remapping, hotstrings, pixel triggers and macros, inspired by TGMacro.
+
+ZxCMC is a keyboard remapper and command launcher for power users: bind any key combination to a shell command, to another key press, or to a recorded macro, optionally scoped to a single application window. It is a single, binary-free script with no installer and no runtime dependencies beyond the interpreter — written once in [AutoHotkey](https://www.autohotkey.com/) v2 syntax and shipped as two runnables: `zxcmc.ahk` (AutoHotkey v2.0, Windows — the canonical implementation) and `zxcmc.ks` (a mechanical mirror of the same code for [Keysharp](https://github.com/keysharp-org/Keysharp), the cross-platform .NET port, covering Windows/Linux/macOS). All bindings live in one plain-text file, `keybinds.cfg`, next to the script, and every feature is also reachable from a borderless GUI and a tray menu.
 
 ---
 
@@ -49,7 +51,7 @@ ReBindX is a keyboard remapper and command launcher for power users: bind any ke
 - **Keyboard navigation** — F1 show/hide, Del delete, Enter edit, Ctrl+Z undo, right-click row menus; F1 itself is rebindable.
 - **Tooltips** on the settings controls and filter boxes (Windows-only in the Keysharp port).
 - **Row icons** — shipped `icons/gear.ico` (commands) and `icons/keyboard.ico` (remaps); degrade silently if missing.
-- **Error log** — timestamped entries in `%APPDATA%\ReBindX\error.log`; logging never throws.
+- **Error log** — timestamped entries in `%APPDATA%\ZxCMC\error.log`; logging never throws.
 - **Atomic config saves** — writes go to a `.tmp` file that atomically replaces the target, so a crash or disk-full can never destroy your config.
 - **Dirty-state exit protection** — every exit path funnels through one vetoable exit hook that prompts about unsaved changes.
 
@@ -60,16 +62,16 @@ ReBindX is a keyboard remapper and command launcher for power users: bind any ke
 ### Windows — AutoHotkey v2.0 (canonical)
 
 1. Install [AutoHotkey v2.0](https://www.autohotkey.com/) or later v2.x. The script declares `#Requires AutoHotkey v2.0` and deliberately avoids v2.1-only syntax, so plain v2.0 works.
-2. Run `rebindx.ahk` (double-click it, or `AutoHotkey.exe rebindx.ahk` from a terminal).
+2. Run `zxcmc.ahk` (double-click it, or `AutoHotkey.exe zxcmc.ahk` from a terminal).
 3. Optional: launch with `--silent` to start with the window hidden (this is the argument the built-in *Run at startup* shortcut uses).
-4. Optional static check: `AutoHotkey.exe /Validate /ErrorStdOut rebindx.ahk` (exit code 0 = clean load).
+4. Optional static check: `AutoHotkey.exe /Validate /ErrorStdOut zxcmc.ahk` (exit code 0 = clean load).
 
-Expected files next to the script (all optional — sensible defaults apply if missing): `keybinds.cfg`, `theme.cfg`, `rebindxsettings.ini`, `icons/`.
+Expected files next to the script (all optional — sensible defaults apply if missing): `keybinds.cfg`, `theme.cfg`, `zxcmcsettings.ini`, `icons/`.
 
 ### Windows / Linux / macOS — Keysharp
 
 1. Install [Keysharp](https://github.com/keysharp-org/Keysharp) ([docs](https://keysharp-org.github.io/KeysharpDocs), [releases](https://github.com/keysharp-org/Keysharp/releases)). It is a .NET-based reimplementation targeting AutoHotkey v2.1-alpha.33 compatibility and requires the **.NET 10** runtime. Per its own README it is *under active development and not yet recommended for production*; Windows has the broadest compatibility.
-2. Run `rebindx.ks` with the `keysharp` executable. Note the port adds `#Requires capability InputMonitoring, InputControl, WindowMonitoring` — off-Windows, first runs may show authorization dialogs, and a denied capability makes Keysharp exit with an error naming it.
+2. Run `zxcmc.ks` with the `keysharp` executable. Note the port adds `#Requires capability InputMonitoring, InputControl, WindowMonitoring` — off-Windows, first runs may show authorization dialogs, and a denied capability makes Keysharp exit with an error naming it.
 
 **Runtime support caveat:** hotkeys, `InputHook`, `Send` and `GetKeyState` are **Full on Windows but Partial on Linux/macOS** per the porting notes — X11 support is broader; on Wayland, global hotkey capture varies by compositor (foreign windows on COSMIC/generic wlroots expose no PID). See [Status & caveats](#status--caveats).
 
@@ -96,8 +98,8 @@ Two caveats worth repeating: **always wrap `keysharp` in `timeout`** on dev mach
 
 | File | Compiled from | Size |
 |---|---|---|
-| `dist/rebindx.cks` | `rebindx.ahk` (unchanged) | 133,120 bytes |
-| `dist/rebindx-ks.cks` | `rebindx.ks` | 128,512 bytes |
+| `dist/zxcmc.cks` | `zxcmc.ahk` (unchanged) | 133,120 bytes |
+| `dist/zxcmc-ks.cks` | `zxcmc.ks` | 128,512 bytes |
 
 ---
 
@@ -105,9 +107,9 @@ Two caveats worth repeating: **always wrap `keysharp` in `timeout`** on dev mach
 
 ### First launch
 
-Run `rebindx.ahk`. On first launch ReBindX loads `keybinds.cfg` from the script's folder (creating an empty `Default` profile if the file is missing), shows the main window, and puts a tray icon in the notification area. Nothing else is installed.
+Run `zxcmc.ahk`. On first launch ZxCMC loads `keybinds.cfg` from the script's folder (creating an empty `Default` profile if the file is missing), shows the main window, and puts a tray icon in the notification area. Nothing else is installed.
 
-Press **F1** at any time — in any application — to hide or show the ReBindX window. A single left-click on the tray icon does the same.
+Press **F1** at any time — in any application — to hide or show the ZxCMC window. A single left-click on the tray icon does the same.
 
 ### The shipped `keybinds.cfg`, line by line
 
@@ -210,10 +212,10 @@ A *Command Mapper* action is dispatched by its first character(s):
 
 | Action | Prefix | Behavior |
 |---|---|---|
-| `taskmgr` | *(none)* | Runs hidden through the selected shell (`.ks`; fallback `/bin/sh` off-Windows) / `cmd.exe` (`.ahk`): `cmd /c taskmgr` on Windows with the default `cmd` selection. **In `rebindx.ahk` the no-prefix branch is always `cmd.exe`.** **In `rebindx.ks` it runs through the selected shell**, since `cmd.exe` does not exist off-Windows — a documented divergence between the two scripts. |
+| `taskmgr` | *(none)* | Runs hidden through the selected shell (`.ks`; fallback `/bin/sh` off-Windows) / `cmd.exe` (`.ahk`): `cmd /c taskmgr` on Windows with the default `cmd` selection. **In `zxcmc.ahk` the no-prefix branch is always `cmd.exe`.** **In `zxcmc.ks` it runs through the selected shell**, since `cmd.exe` does not exist off-Windows — a documented divergence between the two scripts. |
 | `&sudo apt update` | `&` | Runs through the shell selected in Settings (hidden or visible per the console setting). With the shell-detection layer: the detected shell's family decides the invocation — `cmd` → `/c`, `powershell`/`pwsh` → `-NoProfile -Command`, POSIX shells (`bash`, `zsh`, `sh`, …) → `-c` with escaped internal quotes. **If the selected shell is bash, the command is first validated with `bash -n`** (see below). |
 | `>Hello world` | `>` | Sends text/keys (`Send`) instead of running a program. |
-| `@MsgBox "hi"` | `@` | Runs AutoHotkey code by writing it to a temp script (`ReBindX_expr_<id>.ahk` in `%TEMP%`) and launching `A_AhkPath` on it. **Not available in compiled builds** (status message + log). |
+| `@MsgBox "hi"` | `@` | Runs AutoHotkey code by writing it to a temp script (`ZxCMC_expr_<id>.ahk` in `%TEMP%`) and launching `A_AhkPath` on it. **Not available in compiled builds** (status message + log). |
 | `&&foo`, `>>foo`, `@@foo` | doubled | Escape hatch: strip one character and run through the default (no-prefix) handler, so the extra `&`/`>`/`@` is passed literally. |
 
 #### Shell detection + bash validation
@@ -226,7 +228,7 @@ The Settings tab's *Shell for & commands* control offers the shells actually ins
 - **Each shell entry** carries an `Id` (lowercased executable basename — this is what gets persisted), display `Name`, absolute `Path`, `ArgStyle` (`/c`, `-Command`, `-c`) and a `Family` (`cmd`, `ps`, `posix`) that decides invocation semantics.
 - **The INI setting `ShellCmd` becomes a shell Id** (`"cmd"`, `"powershell"`, `"pwsh"`, `"bash"`, `"zsh"`, `"sh"`, …). Backward compatible with the previous `"cmd"`/`"powershell"` values; if the saved Id is not among the detected shells, the first detected shell is used (and the setting updated).
 - **Bash syntax validation:** when the selected shell's Id is `bash`, `&`-commands are first written to a temp file and checked with `bash -n` via `RunWait`; a non-zero exit means the command is **not executed** — the syntax error is logged and shown in the status strip. Validation is always-on for bash (it costs milliseconds) and only for bash — other shells have incompatible syntax and could false-reject.
-- Startup cleanup of leftover temp scripts is extended to the validation files (`ReBindX_syntax_*.sh`).
+- Startup cleanup of leftover temp scripts is extended to the validation files (`ZxCMC_syntax_*.sh`).
 
 #### Per-profile macros and settings
 
@@ -254,9 +256,9 @@ A *Key Remapper* action is translated to a `Send` string by three grammar forms 
 
 Text syntax is accepted for outputs too (`WIN+CTRL+ALT+G`, `win g`) — but only when the *entire* action is text syntax, so macro strings containing words like "alt" are never mangled.
 
-### `rebindxsettings.ini`
+### `zxcmcsettings.ini`
 
-Section `[SETTINGS]`. **In the AutoHotkey suite this file is UTF-16 with a BOM** — the only Unicode encoding the Win32 INI APIs support; ReBindX normalizes it automatically on first load if it finds another encoding; **do not resave it as UTF-8** (values would mojibake or silently drop on some locales). **The Keysharp port normalizes to BOM-less UTF-8 instead** — Keysharp's .NET-based `IniRead`/`IniWrite` read and write plain text, so the `.ks` converts the shipped file once on its first load. Either suite can read the other's output for the ASCII values stored here.
+Section `[SETTINGS]`. **In the AutoHotkey suite this file is UTF-16 with a BOM** — the only Unicode encoding the Win32 INI APIs support; ZxCMC normalizes it automatically on first load if it finds another encoding; **do not resave it as UTF-8** (values would mojibake or silently drop on some locales). **The Keysharp port normalizes to BOM-less UTF-8 instead** — Keysharp's .NET-based `IniRead`/`IniWrite` read and write plain text, so the `.ks` converts the shipped file once on its first load. Either suite can read the other's output for the ASCII values stored here.
 
 | Key | Default | Range | Meaning |
 |---|---|---|---|
@@ -293,7 +295,7 @@ Built-in presets: **Dark** `1E1E1E / 2D2D2D / FFFFFF / 9E9E9E / 255` (default), 
 
 ### GUI tour
 
-The main window (borderless; title *"ReBindX - Key remapper utility"*) is organized as a left **sidebar** of action buttons, four **tabs**, and a bottom **status strip**. Hiding the window (F1, Esc, tray, or its Close event) never exits the app — it keeps running in the tray. Exit is only via the *Exit* button or tray *Exit*, both of which respect unsaved changes.
+The main window (borderless; title *"ZxCMC - Key remapper utility"*) is organized as a left **sidebar** of action buttons, four **tabs**, and a bottom **status strip**. Hiding the window (F1, Esc, tray, or its Close event) never exits the app — it keeps running in the tray. Exit is only via the *Exit* button or tray *Exit*, both of which respect unsaved changes.
 
 **Sidebar buttons**
 
@@ -399,7 +401,7 @@ Structured macros persist in the same `[Macros]` section as a compact token line
 
 | Shortcut | Where | Action |
 |---|---|---|
-| **F1** | Global (any app) | Hide/show the ReBindX window. And yes — F1 itself is rebindable. |
+| **F1** | Global (any app) | Hide/show the ZxCMC window. And yes — F1 itself is rebindable. |
 | **Del** | Main window, a list has focus | Delete the selected rows (confirms if >1). |
 | **Ctrl+Z** | Main window, a list has focus | Undo the last change (10 levels). |
 | **Enter** | Main window, a list has focus | Edit the first selected row. |
@@ -407,7 +409,7 @@ Structured macros persist in the same `[Macros]` section as a compact token line
 | **Right-click** | A row | Menu: *Enable/Disable binding*, *Edit...*, *Delete*. |
 | **Esc** | Main window | Hide the window (does not exit). |
 
-Del and Ctrl+Z pass through to the focused control when a list is not focused; all app hotkeys use the `$` prefix so ReBindX's own `Send` output can never re-trigger them.
+Del and Ctrl+Z pass through to the focused control when a list is not focused; all app hotkeys use the `$` prefix so ZxCMC's own `Send` output can never re-trigger them.
 
 ### Tray menu
 
@@ -425,10 +427,10 @@ Del and Ctrl+Z pass through to the focused control when a list is not focused; a
 
 ## Troubleshooting
 
-- **First stop: the error log.** Everything that goes wrong is logged with a timestamp to `%APPDATA%\ReBindX\error.log` (created on demand; entries capped at 2000 characters so a huge import cannot balloon it; logging itself can never crash the app). Check it after any "… - see error log" status message.
+- **First stop: the error log.** Everything that goes wrong is logged with a timestamp to `%APPDATA%\ZxCMC\error.log` (created on demand; entries capped at 2000 characters so a huge import cannot balloon it; logging itself can never crash the app). Check it after any "… - see error log" status message.
 - **Rejected config lines.** Load and Import report malformed lines (bad key, empty profile name, duplicates, non-`KEY;PAYLOAD` shape) in a dialog with line numbers, and log the same. Fix the line or remove it — parsing skips rejects and continues.
 - **"Hotkey registration failed for X"** — the key could not be registered (typically another application owns it, or the OS rejects it). The failure is logged; the binding stays in the list so you can rebind it to another key.
-- **Settings not saving / mojibake in the INI.** `rebindxsettings.ini` must stay **UTF-16** — the app re-normalizes it automatically if it finds UTF-8/ANSI, but don't edit-and-resave it as UTF-8 yourself. Settings are written on exit, so kill the app gracefully.
+- **Settings not saving / mojibake in the INI.** `zxcmcsettings.ini` must stay **UTF-16** — the app re-normalizes it automatically if it finds UTF-8/ANSI, but don't edit-and-resave it as UTF-8 yourself. Settings are written on exit, so kill the app gracefully.
 - **`@` actions don't run in a compiled build** — by design; the `@` prefix needs `A_AhkPath` and is disabled when the script is compiled.
 - **Startup toggle says it needs admin** — creating/removing the Startup-folder shortcut requires elevation; relaunch as administrator to use it.
 - **Known-fixed bugs & their stories** — the engineering audit in [`ANALYSIS.md`](ANALYSIS.md) (especially the §6 addendum) documents every fixed defect and the reasoning, e.g. the mangled `!Tab 2` repeat form, text-syntax mangling of words like "waltz", duplicate GUI rebuilds on show, wrong LVM color constants, and the INI encoding direction.
@@ -440,19 +442,19 @@ Del and Ctrl+Z pass through to the focused control when a list is not focused; a
 
 | Path | Purpose |
 |---|---|
-| `rebindx.ahk` | The canonical implementation — AutoHotkey v2.0 app for Windows (~2250 lines, class-based state, hotkey engine, GUI, tray, config I/O). |
-| `rebindx.ks` | The Keysharp cross-platform port — a mechanical mirror of the `.ahk` plus platform branches (`#Requires capability`, `#if WINDOWS` guards, restructured UpDown controls) so the two stay diffable. |
+| `zxcmc.ahk` | The canonical implementation — AutoHotkey v2.0 app for Windows (~2250 lines, class-based state, hotkey engine, GUI, tray, config I/O). |
+| `zxcmc.ks` | The Keysharp cross-platform port — a mechanical mirror of the `.ahk` plus platform branches (`#Requires capability`, `#if WINDOWS` guards, restructured UpDown controls) so the two stay diffable. |
 | `keybinds.cfg` | Your bindings — the shipped example doubles as the working config, loaded from the script's folder. |
-| `rebindxsettings.ini` | Settings file (UTF-16 with BOM; see [reference](#rebindxsettingsini)). |
+| `zxcmcsettings.ini` | Settings file (UTF-16 with BOM; see [reference](#zxcmcsettingsini)). |
 | `theme.cfg` | Commented theme example; every key documented inline. |
 | `icons/` | Row icons for the list views — `gear.ico` (command bindings), `keyboard.ico` (key remaps), generated by `Resources/make_icons.py`. |
-| `dist/` | Keysharp compile artifacts: `rebindx.cks` (from the `.ahk`) and `rebindx-ks.cks` (from the `.ks`). *(gitignored)* |
+| `dist/` | Keysharp compile artifacts: `zxcmc.cks` (from the `.ahk`) and `zxcmc-ks.cks` (from the `.ks`). *(gitignored)* |
 | `ANALYSIS.md` | The engineering audit of the original code plus the addendum explaining every fix and design decision in the rewrite. |
 | `keysharp.md` | The Keysharp port plan, with verified upstream links. |
 | `Resources/` | Working notes, not shipped: the shell-detection spec, Keysharp porting notes + brief, the rev-2 design spec, the doc-verified AHK API facts file, upstream doc captures, `tools/check_balance.py` (parenthesis/brace balance checker), `make_icons.py`, review snapshots. *(gitignored)* |
 | `.gitignore` | Ignores `Resources/`, `dist/`, `*.cks`. |
 
-*(Currently git tracks only `rebindx.ahk`; the other root files are working-tree additions — see `git status`.)*
+*(Currently git tracks only `zxcmc.ahk`; the other root files are working-tree additions — see `git status`.)*
 
 ---
 
@@ -462,7 +464,7 @@ The honest section. This codebase has been **thoroughly reviewed statically but 
 
 - `keysharp --validate-syntax` → rc=0 for both scripts; `keysharp --validate` → "Compilation succeeded"; full assembly builds exist in `dist/`.
 - `python3 Resources/tools/check_balance.py` → no structural errors for both scripts.
-- Suggested (pending) verification on a Windows machine: `AutoHotkey.exe /Validate /ErrorStdOut rebindx.ahk`, then a smoke pass of add/edit/delete/toggle, profile switching, importing the shipped `keybinds.cfg`, and one macro recording.
+- Suggested (pending) verification on a Windows machine: `AutoHotkey.exe /Validate /ErrorStdOut zxcmc.ahk`, then a smoke pass of add/edit/delete/toggle, profile switching, importing the shipped `keybinds.cfg`, and one macro recording.
 
 **During initial development no script was executed** — the devbox's Keysharp runtime components were broken, so the port was validated by syntax check, compilation and assembly only. Runtime testing has since begun (user-driven, because Keysharp occasionally requires root permissions on this device): the first Keysharp run of the GUI surfaced and fixed one real defect — Keysharp controls have no `Show()`/`Hide()` methods, so the empty-state hints now toggle via the portable `Visible` property (both files, mirrored). Known runtime expectations (from the official docs/capabilities matrix, per `Resources/keysharp_porting_notes.md`), pending continued smoke-testing:
 

@@ -3,3 +3,5 @@ tests/
 *.ini
 *.cfg
 ANALYSIS.md
+# atomic-save temp files
+*.tmp
