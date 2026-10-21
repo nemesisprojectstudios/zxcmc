@@ -2,7 +2,11 @@
 
 **Zx's Crossplatform Macro Client** - cross-platform hotkey remapping, hotstrings, pixel triggers and macros, inspired by TGMacro.
 
-ZxCMC is a keyboard remapper and command launcher for power users: bind any key combination to a shell command, to another key press, or to a recorded macro, optionally scoped to a single application window. It is a single, binary-free script with no installer and no runtime dependencies beyond the interpreter — written once in [AutoHotkey](https://www.autohotkey.com/) v2 syntax and shipped as two runnables: `zxcmc.ahk` (AutoHotkey v2.0, Windows — the canonical implementation) and `zxcmc.ks` (a mechanical mirror of the same code for [Keysharp](https://github.com/keysharp-org/Keysharp), the cross-platform .NET port, covering Windows/Linux/macOS). All bindings live in one plain-text file, `keybinds.cfg`, next to the script, and every feature is also reachable from a borderless GUI and a tray menu.
+ZxCMC is a keyboard remapper and command launcher for power users: bind any key combination to a shell command, to another key press, or to a recorded macro, optionally scoped to a single application window. It is a single, binary-free script with no installer and no runtime dependencies beyond the interpreter — written in [AutoHotkey](https://www.autohotkey.com/) v2 syntax and shipped as several runnables: `zxcmc.ahk` (AutoHotkey v2.0, Windows-only) and `zxcmc.ks` (a mechanical mirror of the same code for [Keysharp](https://github.com/keysharp-org/Keysharp), the cross-platform .NET port, covering Windows/Linux/macOS). All bindings live in one plain-text file, `keybinds.cfg`, next to the script, and every feature is also reachable from a borderless GUI and a tray menu.  
+Pre-compiled binaries live in the `dist` directory (compiled via Keysharp):
+- zxcmc.cks - corresponds to zxcmc.ahk
+- zxcmc-ks.cks - corresponds to zxcmc.ks
+- zxcmc-ks-noprocesspriority - corresponds to zxcmc.ks, with lines 47-50 removed, as some Linux distributions/desktop environments refuse to parse `try ProcessSetPriority("AboveNormal")` properly, which results in exceptions.
 
 ---
 
@@ -72,46 +76,30 @@ Expected files next to the script (all optional — sensible defaults apply if m
 
 1. Install [Keysharp](https://github.com/keysharp-org/Keysharp) ([docs](https://keysharp-org.github.io/KeysharpDocs), [releases](https://github.com/keysharp-org/Keysharp/releases)). It is a .NET-based reimplementation targeting AutoHotkey v2.1-alpha.33 compatibility and requires the **.NET 10** runtime. Per its own README it is *under active development and not yet recommended for production*; Windows has the broadest compatibility.
 2. Run `zxcmc.ks` with the `keysharp` executable. Note the port adds `#Requires capability InputMonitoring, InputControl, WindowMonitoring` — off-Windows, first runs may show authorization dialogs, and a denied capability makes Keysharp exit with an error naming it.
+3. Running through Keysharp on Linux devices defaults to using the active user's GTK theme. A misconfigured GTK theme may cause visual artifacting or discoloration on the UI. Linux therefore does not support configuration through `theme.cfg` (see later), while Windows defaults to applying the `theme.cfg` configuration as Keysharp runs GUI operations through native WinUI. 
 
 **Runtime support caveat:** hotkeys, `InputHook`, `Send` and `GetKeyState` are **Full on Windows but Partial on Linux/macOS** per the porting notes — X11 support is broader; on Wayland, global hotkey capture varies by compositor (foreign windows on COSMIC/generic wlroots expose no PID). See [Status & caveats](#status--caveats).
-
-### Compiling with the Keysharp CLI
-
-Both scripts compile under Keysharp. The verified command set (from `Resources/keysharp_porting_notes.md`):
-
-```bash
-mkdir -p /tmp/opencode                                   # /tmp is wiped on reboots
-# NEVER run keysharp without timeout - it opens blocking GUI windows.
-timeout 120 keysharp --errorstdout --validate-syntax <file>   # rc=0 ok; rc=1 = errors in output
-timeout 300 keysharp --errorstdout --validate <file>         # prints "Compilation succeeded"
-timeout 600 keysharp --errorstdout --compile asm --dest dist/<name>.cks <file>
-# ^ --dest MUST come BEFORE the script path, or it is silently ignored and
-#   the .cks lands next to the source script instead.
-timeout 600 keysharp --errorstdout --compile exe --dest dist/<name> <file>   # standalone exe (untested here)
-```
-
-Two caveats worth repeating: **always wrap `keysharp` in `timeout`** on dev machines (a launched script opens GUI windows that block the terminal), and **`--dest` must precede the script path** or it is silently ignored.
 
 ### The `.cks` files in `dist/`
 
 `dist/` contains Keysharp assembly builds (`--compile asm` output) of both scripts, produced during validation:
 
-| File | Compiled from | Size |
+| File | Compiled from | Changes |
 |---|---|---|
-| `dist/zxcmc.cks` | `zxcmc.ahk` (unchanged) | 133,120 bytes |
-| `dist/zxcmc-ks.cks` | `zxcmc.ks` | 128,512 bytes |
-
+| `dist/zxcmc.cks` | `zxcmc.ahk` | Unchanged |
+| `dist/zxcmc-ks.cks` | `zxcmc.ks` | Unchanged |
+| `dist/zxcmc-ks-noprocesspriority.cks` | `zxcmc.ks` | Lines 47-50 removed |
 ---
 
 ## Quick start
 
 ### First launch
 
-Run `zxcmc.ahk`. On first launch ZxCMC loads `keybinds.cfg` from the script's folder (creating an empty `Default` profile if the file is missing), shows the main window, and puts a tray icon in the notification area. Nothing else is installed.
+Run any `zxcmc` script or compiled assembly. On first launch ZxCMC loads `keybinds.cfg` from the script's folder (creating an empty `Default` profile if the file is missing), shows the main window, and puts a tray icon in the notification area. Nothing else is installed.
 
 Press **F1** at any time — in any application — to hide or show the ZxCMC window. A single left-click on the tray icon does the same.
 
-### The shipped `keybinds.cfg`, line by line
+### An example keybinds.cfg (Windows)
 
 ```ahk
 #ESCAPE;taskmgr
@@ -234,7 +222,7 @@ The Settings tab's *Shell for & commands* control offers the shells actually ins
 
 Macros and the three repeat settings (`DoRepeatOutputs`, `RepeatBuffer`, `RepeatDelay`) are per-profile. They persist inside each profile section:
 
-```ahk
+```
 [Profile:Work]
 set:RepeatBuffer;120
 macro:login;user{Tab}pass{Enter}
@@ -449,24 +437,11 @@ Del and Ctrl+Z pass through to the focused control when a list is not focused; a
 | `theme.cfg` | Commented theme example; every key documented inline. |
 | `icons/` | Row icons for the list views — `gear.ico` (command bindings), `keyboard.ico` (key remaps), generated by `Resources/make_icons.py`. |
 | `dist/` | Keysharp compile artifacts: `zxcmc.cks` (from the `.ahk`) and `zxcmc-ks.cks` (from the `.ks`). *(gitignored)* |
-| `ANALYSIS.md` | The engineering audit of the original code plus the addendum explaining every fix and design decision in the rewrite. |
-| `keysharp.md` | The Keysharp port plan, with verified upstream links. |
-| `Resources/` | Working notes, not shipped: the shell-detection spec, Keysharp porting notes + brief, the rev-2 design spec, the doc-verified AHK API facts file, upstream doc captures, `tools/check_balance.py` (parenthesis/brace balance checker), `make_icons.py`, review snapshots. *(gitignored)* |
-| `.gitignore` | Ignores `Resources/`, `dist/`, `*.cks`. |
-
-*(Currently git tracks only `zxcmc.ahk`; the other root files are working-tree additions — see `git status`.)*
+| `.gitignore` | Ignores `Resources/`, `tests/` and configuration/save files |
 
 ---
 
 ## Status & caveats
-
-The honest section. This codebase has been **thoroughly reviewed statically but not runtime-tested**: two independent review rounds (correctness against doc-verified API facts, and a security audit — see `ANALYSIS.md` §6.4) plus mechanical validation:
-
-- `keysharp --validate-syntax` → rc=0 for both scripts; `keysharp --validate` → "Compilation succeeded"; full assembly builds exist in `dist/`.
-- `python3 Resources/tools/check_balance.py` → no structural errors for both scripts.
-- Suggested (pending) verification on a Windows machine: `AutoHotkey.exe /Validate /ErrorStdOut zxcmc.ahk`, then a smoke pass of add/edit/delete/toggle, profile switching, importing the shipped `keybinds.cfg`, and one macro recording.
-
-**During initial development no script was executed** — the devbox's Keysharp runtime components were broken, so the port was validated by syntax check, compilation and assembly only. Runtime testing has since begun (user-driven, because Keysharp occasionally requires root permissions on this device): the first Keysharp run of the GUI surfaced and fixed one real defect — Keysharp controls have no `Show()`/`Hide()` methods, so the empty-state hints now toggle via the portable `Visible` property (both files, mirrored). Known runtime expectations (from the official docs/capabilities matrix, per `Resources/keysharp_porting_notes.md`), pending continued smoke-testing:
 
 1. **Hotkeys / InputHook / Send / GetKeyState: Full on Windows, Partial on Linux/macOS.** X11 support is broader; on Wayland, global hotkey capture and PID availability vary by compositor.
 2. **Capability prompts** on first run off-Windows (`#Requires capability InputMonitoring, InputControl, WindowMonitoring`); a denied capability exits with an error naming it.
@@ -483,4 +458,4 @@ The **shell detection + bash validation** layer is implemented in both scripts a
 
 ## License
 
-No license file is present in this repository. All rights are reserved by default; anyone wishing to use, modify or redistribute the code should ask the maintainer to add an explicit license first.
+Licensed under the MIT license.
