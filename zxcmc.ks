@@ -2,7 +2,7 @@
 ; ZxCMC - Key remapper utility
 ; AutoHotkey v2.0 - full rewrite per rev-2 design spec
 ; Keysharp port (zxcmc.ks): mechanical mirror of zxcmc.ahk
-;   plus platform adaptations - see Resources/keysharp_porting_notes.md
+;   plus platform adaptations for Windows, Linux and macOS
 ;
 ; Comment convention used throughout this file:
 ;   ;        regular comment
@@ -37,17 +37,16 @@
 ; ! #Requires capability: input monitoring/control permissions -
 ;   without them hotkeys and the recorder cannot work (macOS prompts
 ;   at first run; Linux needs the keysharp input hook active).
-; ? ProcessSetPriority("AboveNormal") - questionable for a user
-;   utility; consider Normal if input latency ever matters.
 #Requires AutoHotkey v2.0
 #Requires capability InputMonitoring, InputControl, WindowMonitoring
 #SingleInstance Force
 #UseHook
 
-try 
-{
-    ProcessSetPriority("AboveNormal")
-}
+; // ProcessSetPriority removed (round 125): on some devices the
+; // underlying .NET priority call raises a NATIVE CLR exception that
+; // try/catch CANNOT intercept (Keysharp catches AHK Error objects
+; // only - the user's try-wrapped call still crashed there). The
+; // bump was optional anyway (flagged questionable in round 113).
 SetWinDelay(-1)
 SetControlDelay(-1)
 
@@ -1804,14 +1803,29 @@ RemoveBinding(id) {
 ; Braces around a repeat-form base key are stripped first so both
 ; "Tab 2" and "{Tab} 2" produce "{Tab 2}". Modifiers always stay
 ; inside the SAME Send string (facts R3).
+; * True when an output base names a real key: a single character or
+; * a known multi-char key name (KEY_LIST). Anything else ("zx",
+; * "hello") is MACRO TEXT - brace-wrapping it produced "{zx}", which
+; * Send rejects behind the catch (user report: 1:N remaps and
+; * single-word macros parsed but never executed).
+ValidOutputKey(base) {
+    if (StrLen(base) = 1)
+        return true
+    return App.ValidKeys.Has(StrUpper(base))
+}
+
 BuildKeyOutput(action) {
     if RegExMatch(action, "^([\^!+#]*)(\{[^}]+\}|[A-Za-z0-9_]+)[ ]+(\d+)$", &m) {
         base := RegExReplace(m[2], "^\{|\}$", "")
-        return m[1] "{" base " " m[3] "}"
+        if ValidOutputKey(base)
+            return m[1] "{" base " " m[3] "}"
+        return action   ; repeat form over macro text: send literally
     }
-    if RegExMatch(action, "^([\^!+#]*)(\w+)$", &m)
-        return m[1] "{" m[2] "}"
-    return action
+    if RegExMatch(action, "^([\^!+#]*)(\w+)$", &m) {
+        if ValidOutputKey(m[2])
+            return m[1] "{" m[2] "}"
+    }
+    return action   ; macro string ("zx"): sent as-is, key by key
 }
 
 ; Command dispatch (feature 7). "&" runs via the shell selected in
@@ -1819,8 +1833,7 @@ BuildKeyOutput(action) {
 ; first - see RunViaShell); ">" sends; "@" runs a temporary AHK
 ; script (guarded by A_IsCompiled per facts 19a); doubled prefixes
 ; escape; anything else runs hidden through the selected shell
-; (Keysharp divergence - cmd.exe is not assumed off-Windows; see
-; Resources/keysharp_porting_notes.md).
+; (Keysharp divergence - cmd.exe is not assumed off-Windows).
 BindCmd(id, *) {
     b := GetBinding(id)
     if !IsObject(b)
@@ -2383,13 +2396,13 @@ BuildMainGui() {
     guide.UseTab(3)
     App.Ui["GuideTxts"].Push(g.Add("Text", "xc+10 yc+10 w" gw " h" (tabH - 76) " " TransOpt() " -Wrap", "COMMAND PREFIXES (Command Mapper actions)`n- &command  runs through the shell selected in Settings, hidden or visible per the console setting`n- Bash commands are syntax-checked (bash -n) before running`n- >text  sends text/keys instead of running a program`n- @code  runs AutoHotkey code via a temporary .ahk file (not available in compiled builds)`n- Doubled prefix (&&, >>, @@) passes the character through to the default handler`n- No prefix: hidden cmd.exe (Windows) / selected shell (Keysharp)`n`nSHELLS`n- The Settings tab selects the shell for & commands (cmd.exe or PowerShell on Windows; on Linux/macOS the list is discovered from the system)`n- bash is validated with bash -n before every run - syntax errors are reported and the command is NOT executed`n- rw: runs a command and WAITS for it to finish before the next macro action; run: proceeds immediately`n`nKEY REMAP REPEAT`n- !Tab 2 = press Tab twice with Alt held`n- Repeat-while-held: the Settings tab toggles whether holding the trigger key keeps repeating the output, with buffer/delay values (per-profile)"))
     guide.UseTab(4)
-    App.Ui["GuideTxts"].Push(g.Add("Text", "xc+10 yc+10 w" gw " h" (tabH - 76) " " TransOpt() " -Wrap", "MACROS`n- A macro is a reusable Send sequence stored in the macro library (Macros tab)`n- Bindings reference macros by name: a Key Remap output of macro:Name replays it`n- Editing a macro instantly updates every binding that uses it`n`nTHE BUILDER (Builder... button)`n- Build macros one action at a time: Key press (with hold duration), Key down, Key up, Wait (ms), Run command (with wait-until-return), Mouse move (X/Y, relative, hold a key while moving), Sequence (raw Send string)`n- Loop start / Loop end wrap a part of the sequence; loops need unique names`n- Endloop must match the innermost open loop, every loop must be closed before saving`n- Clone duplicates the selected action(s) in place; a multi-selection pastes after the last one`n- Test run executes the current sequence once`n`nTRIGGER MODES (per macro)`n- On key press: fires when the assigned key goes down`n- On key release: fires when the assigned key goes up`n- Repeat while held: repeats with per-macro buffer/delay`n- Pixel watch: fires while the pixel at X,Y turns to / turns from a color; the watcher polls while ZxCMC runs`n- Pixel capture may be unavailable on some compositors (watcher disables itself and logs once)`n`nMACRO GRAMMAR (stored per profile)`n- trg:press|release|repeat  trigger mode`n- rbuf:ms / rdel:ms  repeat buffer/delay`n- px:x,y,RRGGBB,to|from  pixel trigger`n- kd:Key / ku:Key / kp:Key[:holdMs]  key actions`n- w:ms  wait`n- run:cmd / rw:cmd  shell (async / wait)`n- mm:x,y,rel|abs[,hold:Key]  mouse move`n- loop:Name:Count ... endloop:Name  repetition`n- sq:string  raw Send sequence`n- snd:string  full AHK Send() syntax ({Raw}/{Blind}/{Text}, {VK}/{SC}/{U+}/{ASC nnnnn}, DownR/DownTemp)`n- A literal | inside a parameter is stored as {PIPE}"))
+    App.Ui["GuideTxts"].Push(g.Add("Text", "xc+10 yc+10 w" gw " h" (tabH - 76) " " TransOpt() " -Wrap", "MACROS`n- A macro is a reusable Send sequence stored in the macro library (Macros tab)`n- Bindings reference macros by name: a Key Remap output of macro:Name replays it`n- Editing a macro instantly updates every binding that uses it`n`nTHE BUILDER (Builder... button)`n- Build macros one action at a time: Key press (with hold duration), Key down, Key up, Wait (ms), Run command (with wait-until-return), Mouse move (X/Y, relative, hold a key while moving), Sequence (raw Send string)`n- Loop start / Loop end wrap a part of the sequence; loops need unique names`n- Endloop must match the innermost open loop, every loop must be closed before saving`n- Clone duplicates the selected action(s) in place; a multi-selection pastes after the last one`n- Test run executes the current sequence once`n`nTRIGGER MODES (per macro)`n- On key press: fires when the assigned key goes down`n- On key release: fires when the assigned key goes up`n- Repeat while held: repeats with per-macro buffer/delay`n- Pixel watch: fires while the pixel at X,Y turns to / turns from a color; the watcher polls while ZxCMC runs`n- Pixel capture may be unavailable on some compositors (watcher disables itself and logs once)`n`nMACRO GRAMMAR (stored per profile)`n- trg:press|release|repeat  trigger mode`n- rbuf:ms / rdel:ms  repeat buffer/delay`n- px:x,y,RRGGBB,to|from  pixel trigger`n- kd:Key / ku:Key / kp:Key[:holdMs]  key actions`n- w:ms  wait`n- run:cmd / rw:cmd  shell (async / wait)`n- mm:x,y,rel|abs[,hold:Key]  mouse move`n- loop:Name:Count ... endloop:Name  repetition`n- sq:string  raw Send sequence`n- snd:string  full AHK Send() syntax ({Raw}/{Blind}/{Text}, {VK}/{SC}/{U+}/{ASC nnnnn}, DownR/DownTemp; advanced mode only)`n- A literal | inside a parameter is stored as {PIPE}"))
     guide.UseTab(5)
-    App.Ui["GuideTxts"].Push(g.Add("Text", "xc+10 yc+10 w" gw " h" (tabH - 76) " " TransOpt() " -Wrap", "HOTSTRINGS`n- A hotstring fires when you TYPE its trigger text anywhere, then an ending character (space, Enter, etc.)`n- Set the Trigger type to Hotstring in the binding editor and type the trigger text`n- Replacement actions follow the binding grammar: >text sends text/keys, no prefix runs a command, & runs via the selected shell, macro:Name replays a library macro`n- The Hotstrings tab lists every hotstring binding with New/Edit/Delete/Toggle`n- Scope works for hotstrings too: [wintitle] limits where the text triggers`n`nPIXEL TRIGGERS`n- Trigger type Pixel: the binding fires when the screen pixel at X,Y turns to (or turns from) a color RRGGBB`n- Polls continuously while ZxCMC runs; fires once per transition and re-arms when the color clears`n- A pixel watcher disables itself (with one log entry) on platforms where pixel capture is unavailable`n`nHOTKEY TRIGGERS`n- The classic form: a hotkey (e.g. #^G) fires the action on key press`n- Multiple bindings may share a hotkey: the LATEST enabled binding wins`n- Per-app scoping via [wintitle]`n- Interception (editor dropdown): ~ passthrough, $ force hook, * wildcard; combinable - the keybind field shows the prefix (~#F), the cfg stores it as a suffix (B~$)"))
+    App.Ui["GuideTxts"].Push(g.Add("Text", "xc+10 yc+10 w" gw " h" (tabH - 76) " " TransOpt() " -Wrap", "HOTSTRINGS`n- A hotstring fires when you TYPE its trigger text anywhere, then an ending character (space, Enter, etc.)`n- Set the Trigger type to Hotstring in the binding editor and type the trigger text`n- Replacement actions follow the binding grammar: >text sends text/keys, no prefix runs a command, & runs via the selected shell, macro:Name replays a library macro`n- The Hotstrings tab lists every hotstring binding with New/Edit/Delete/Toggle`n- Scope works for hotstrings too: [wintitle] limits where the text triggers`n`nPIXEL TRIGGERS`n- Trigger type Pixel: the binding fires when the screen pixel at X,Y turns to (or turns from) a color RRGGBB`n- Polls continuously while ZxCMC runs; fires once per transition and re-arms when the color clears`n- A pixel watcher disables itself (with one log entry) on platforms where pixel capture is unavailable`n`nHOTKEY TRIGGERS`n- The classic form: a hotkey (e.g. #^G) fires the action on key press`n- Multiple bindings may share a hotkey: the LATEST enabled binding wins`n- Per-app scoping via [wintitle]`n- Interception (editor dropdown): ~ passthrough, $ force hook, * wildcard; combinable - the keybind field shows the prefix (~#F), the cfg stores it as a suffix (B~$)`n- Output Send mode (advanced, Key Remap only): a per-remap override, right of Intercept"))
     guide.UseTab(6)
-    App.Ui["GuideTxts"].Push(g.Add("Text", "xc+10 yc+10 w" gw " h" (tabH - 76) " " TransOpt() " -Wrap", "PROFILES`n- A profile bundles bindings, macros AND the three repeat settings`n- Active profile: pick from the dropdown and press Switch (or use the tray menu)`n- New profile...: create from current settings, clone an existing profile, or start empty`n- Save: writes the active profile (one-time warning before saving into Default)`n- Save As...: copy the active profile under a new name and switch to it`n- Rename: type a new name for the ACTIVE profile (disabled for Default)`n- Export... / Import...: single-profile config files, merge-on-import`n- Delete / Clear: removes a non-Default profile (Default is cleared instead)`n- Save to... (sidebar): copies the SELECTED bindings/macros/hotstrings into any profile without switching`n`nSTORAGE`n- Profiles live as [Profile:Name] sections in keybinds.cfg`n- The Default profile is the headerless section at the top`n- macro:Name and set:Key lines inside a section carry its macros and settings`n- Undo (Ctrl+Z) covers profile operations"))
+    App.Ui["GuideTxts"].Push(g.Add("Text", "xc+10 yc+10 w" gw " h" (tabH - 76) " " TransOpt() " -Wrap", "PROFILES`n- A profile bundles bindings, macros AND the three repeat settings`n- Active profile: pick from the dropdown and press Switch (or use the tray menu)`n- New profile...: create from current settings, clone an existing profile, or start empty`n- Save: writes the active profile (one-time warning before saving into Default)`n- Save As...: copy the active profile under a new name and switch to it`n- Rename: type a new name for the ACTIVE profile (disabled for Default)`n- Export... / Import...: single-profile config files, merge-on-import`n- Delete / Clear: removes a non-Default profile (Default is cleared instead)`n- Save to... (sidebar): copies the SELECTED bindings/macros/hotstrings into any profile without switching`n`nSTORAGE`n- Profiles live as [Profile:Name] sections in keybinds.cfg`n- The Default profile is the headerless section at the top`n- macro:Name and set:Key lines inside a section carry its macros and settings`n- Profiles also carry the shell selection, console visibility and (advanced) default Send mode`n- Undo (Ctrl+Z) covers profile operations"))
     guide.UseTab(7)
-    App.Ui["GuideTxts"].Push(g.Add("Text", "xc+10 yc+10 w" gw " h" (tabH - 76) " " TransOpt() " -Wrap", "USING THE WINDOW`n- F1 hides/shows this window (rebindable)`n- Click a row to select; Ctrl+click or Shift+click selects several`n- Double-click a row, or press Enter, to edit; Del deletes the selected rows`n- Right-click a row to toggle/edit/delete that one binding`n- Ctrl+Z undoes the last change (10 levels)`n- The Filter box above each list narrows rows as you type`n- Resize the window freely; the lists follow (the Usage Guide content sets the lower limit)`n`nSETTINGS TAB`n- Repeat outputs/buffer/delay: per-profile remap repeat behavior`n- Run at startup: creates the Startup shortcut (Windows, admin)`n- Shell for & commands + console visibility`n- Start as suspended and Autosave: trigger/persistence defaults`n- Advanced mode + default Send mode (advanced settings live per profile)`n`nFILES`n- keybinds.cfg: bindings, remaps, macros, profiles (UTF-8)`n- zxcmcsettings.ini: settings (BOM-less UTF-8 in this port; the .ahk uses UTF-16)`n- theme.cfg: optional colors; Auto=1 follows Windows dark/light mode`n- errors: error.log inside the ZxCMC folder of the OS application-data directory`n- icons\gear.ico / keyboard.ico: list icons (missing icons degrade silently)"))
+    App.Ui["GuideTxts"].Push(g.Add("Text", "xc+10 yc+10 w" gw " h" (tabH - 76) " " TransOpt() " -Wrap", "USING THE WINDOW`n- F1 hides/shows this window (rebindable)`n- Click a row to select; Ctrl+click or Shift+click selects several`n- Double-click a row, or press Enter, to edit; Del deletes the selected rows`n- Right-click a row to toggle/edit/delete that one binding`n- Suspend (sidebar) pauses all trigger interception until unsuspended - F1, the window and the tray stay live`n- Ctrl+Z undoes the last change (10 levels)`n- The Filter box above each list narrows rows as you type`n- Resize the window freely; the lists follow (the Usage Guide content sets the lower limit)`n`nSETTINGS TAB`n- Repeat outputs/buffer/delay: per-profile remap repeat behavior`n- Run at startup: creates the Startup shortcut (Windows, admin)`n- Shell for & commands + console visibility (both per profile)`n- Start as suspended and Autosave: trigger/persistence defaults`n- Advanced mode: reveals the default Send mode (per profile); per-remap and per-action Send modes and the builder AHK Send action are advanced too`n`nFILES`n- keybinds.cfg: bindings, remaps, macros, profiles (UTF-8)`n- zxcmcsettings.ini: settings (BOM-less UTF-8 in this port; the .ahk uses UTF-16)`n- theme.cfg: optional colors; Auto=1 follows Windows dark/light mode`n- errors: error.log inside the ZxCMC folder of the OS application-data directory`n- icons\gear.ico / keyboard.ico: list icons (missing icons degrade silently)"))
     guide.UseTab()
     SetUIThemeFont(g, "s10 c" App.Theme["Text"])
 
@@ -4059,33 +4072,42 @@ ExecuteMacroToken(tok) {
         case "kp":
             ; kp:Key[:holdMs][#SM:Mode] - a hold duration inserts the
             ; wait between the key-down and the key-up; * a trailing
-            ; #SM:Mode (advanced) wraps this token's send
+            ; #SM:Mode (advanced) wraps this token's send.
+            ; ! the KEY is the part BEFORE the hold colon: arg carries
+            ;   "Key:holdMs" as one string - using arg directly sent
+            ;   "{z:1 down}" for kp:z:1 and Send rejected it (user
+            ;   report round 126; latent since the hold path was
+            ;   written - the dialog's Hold ms defaults to 1, so every
+            ;   dialog-made key press carried a hold and hit it)
             tm := SplitTokenSendMode(&arg)
             prev := ApplySendMode(tm)
-            kp := StrSplit(tok, ":")
-            if (kp.Length >= 3) {
-                kpv := kp[3]
-                SplitTokenSendMode(&kpv)
-                holdMs := SafeInt(kpv, 0)
-                if (holdMs > 0) {
-                    Send("{" arg " down}")
-                    Sleep(holdMs)
-                    Send("{" arg " up}")
-                    RestoreSendMode(prev)
-                    return
-                }
+            colonAt := InStr(arg, ":")
+            if (colonAt > 0) {
+                keyName := SubStr(arg, 1, colonAt - 1)
+                holdMs := SafeInt(SubStr(arg, colonAt + 1), 0)
+            } else {
+                keyName := arg
+                holdMs := 0
             }
-            if (InStr(arg, "{") || RegExMatch(arg, "[\^!+#]"))
-                Send(arg)
-            else
-                Send("{" arg "}")
+            if (keyName != "") {
+                if (holdMs > 0) {
+                    Send("{" keyName " down}")
+                    Sleep(holdMs)
+                    Send("{" keyName " up}")
+                } else if (InStr(keyName, "{") || RegExMatch(keyName, "[\^!+#]"))
+                    Send(keyName)
+                else
+                    Send("{" keyName "}")
+            }
             RestoreSendMode(prev)
         case "kd":
-            prev := ApplySendMode(SplitTokenSendMode(&arg))
+            tm := SplitTokenSendMode(&arg)
+            prev := ApplySendMode(tm)
             Send("{" arg " down}")
             RestoreSendMode(prev)
         case "ku":
-            prev := ApplySendMode(SplitTokenSendMode(&arg))
+            tm := SplitTokenSendMode(&arg)
+            prev := ApplySendMode(tm)
             Send("{" arg " up}")
             RestoreSendMode(prev)
         case "snd":
@@ -4354,7 +4376,9 @@ TokenDisplay(tok) {
             hv := ""
             if (parts.Length >= 3) {
                 hv := parts[3]
-                SplitTokenSendMode(&hv)
+                hcut := InStr(hv, "#")   ; colon-spanning #SM marker tail
+                if (hcut > 0)
+                    hv := SubStr(hv, 1, hcut - 1)
                 hv := "hold " hv " ms"
             }
             return ["Key press", arg, hv]
@@ -4817,7 +4841,11 @@ BuildActionDialog() {
     g.BackColor := App.Theme["Background"]
     ThemedFont(g, "s10 c" App.Theme["Text"])
     g.Add("Text", "x16 y22 w50 h22", "Type:")
-    tddl := g.Add("DDL", "x90 y16 w180 vAType Choose1" FaceBg(), ["Key press", "Key down", "Key up", "Wait", "Run command", "Mouse move", "Sequence", "Loop start", "Loop end", "AHK Send"])
+    types := ["Key press", "Key down", "Key up", "Wait", "Run command", "Mouse move", "Sequence", "Loop start", "Loop end"]
+    ; * the AHK Send action is Advanced-mode-gated (user report, round 125)
+    if (App.Settings["AdvancedMode"])
+        types.Push("AHK Send")
+    tddl := g.Add("DDL", "x90 y16 w180 vAType Choose1" FaceBg(), types)
     tddl.OnEvent("Change", ActionDlgTypeChange)
     ; -- per-type field groups, all sharing the y56 row --
     
@@ -4947,8 +4975,16 @@ PrefillActionDialog(g, tok) {
         which := 7
         g["ASeq"].Value := arg
     } else if (op = "snd") {
-        which := 10
-        g["AS"].Value := arg
+        ; * advanced-gated: without Advanced mode the AHK Send type is
+        ;   not offered - a stored snd: token edits as Sequence (their
+        ;   runtime behavior is identical: both are plain Send)
+        if (App.Settings["AdvancedMode"]) {
+            which := 10
+            g["AS"].Value := arg
+        } else {
+            which := 7
+            g["ASeq"].Value := arg
+        }
     } else if (op = "mm") {
         which := 6
         p := StrSplit(StrReplace(SubStr(tok, 4), "{PIPE}", "|"), ",")
@@ -4974,18 +5010,22 @@ PrefillActionDialog(g, tok) {
         g["ALoopName"].Value := (parts.Length >= 2) ? parts[2] : ""
     }
     if (which <= 3) {
-        ; * strip + capture a trailing #SM:Mode (it may sit on the key
-        ;   part or, with a hold, on the hold part)
-        tm := SplitTokenSendMode(&arg)
-        hv := ""
-        if (parts.Length >= 3) {
-            hv := parts[3]
-            tm2 := SplitTokenSendMode(&hv)
-            if (tm = "")
-                tm := tm2
+        ; * the #SM:Mode marker is the tail of the WHOLE token and can
+        ;   span colon boundaries (kp:z:1#SM:Play) or sit on the key
+        ;   (kp:z#SM:Play) - split it off the token FIRST, then split
+        ;   the base so the key and hold parse cleanly (round 126)
+        baseTok := tok
+        smTxt := ""
+        hashAt := InStr(tok, "#SM:")
+        if (hashAt > 0) {
+            baseTok := SubStr(tok, 1, hashAt - 1)
+            smTxt := SubStr(tok, hashAt + 4)
         }
-        g["AKey"].Value := arg
-        try g["ASm"].Choose(SmLabelIndex(tm))
+        bparts := StrSplit(baseTok, ":")
+        barg := (bparts.Length >= 2) ? StrReplace(bparts[2], "{PIPE}", "|") : ""
+        hv := (bparts.Length >= 3) ? bparts[3] : ""
+        g["AKey"].Value := barg
+        try g["ASm"].Choose(SmLabelIndex(smTxt))
         if (op = "kp" && hv != "")
             g["AHoldMs"].Value := hv
     }
@@ -5060,6 +5100,10 @@ ActionDialogSave(*) {
         }
         tok := "sq:" sq
     } else if (typ = "AHK Send") {
+        if (!App.Settings["AdvancedMode"]) {
+            MsgBox("AHK Send is an Advanced-mode action (enable Advanced mode in Settings).", "Error", "Icon!")
+            return
+        }
         s2 := Trim(g["AS"].Value)
         if (s2 = "") {
             MsgBox("The Send string cannot be empty.", "Error", "Icon!")

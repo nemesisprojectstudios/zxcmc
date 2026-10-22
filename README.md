@@ -29,12 +29,12 @@ Pre-compiled binaries live in the `dist` directory (compiled via Keysharp):
 **Binding types**
 
 - **Command mapper** — bind a hotkey to a shell command. Actions support prefixes: none (hidden `cmd.exe`), `&` (run through the shell selected in Settings, with bash syntax validation when the shell is bash — see [Shell detection](#shell-detection--bash-validation-in-progress)), `>` (send text/keys instead of running a program), `@` (run AutoHotkey code via a temporary script), and doubled `&&`/`>>`/`@@` (literal prefix passthrough).
-- **Key remapper** — bind a hotkey to another key or combination (`!Tab`), with a repeat form (`!Tab 2` = hold Alt, press Tab twice) and full macro strings sent as-is (`{Enter}{Enter}abc`).
-- **Trigger kinds** — every command binding can trigger on a **hotkey**, a **hotstring** (typed text + ending character) or a **pixel** (screen pixel turns to/from a color); remaps stay hotkey-only. Bindings can be scoped to one program (`[ahk_exe chrome.exe]`).
-- **Macro Builder** — build macros one action at a time (key press/down/up with hold duration, waits, shell commands with wait-until-return, mouse moves with a held key, raw Send sequences), with named loops, per-macro trigger modes (press/release/repeat-while-held/pixel-watch) and a Test-run button.
-- **Profiles** — bindings, macros and repeat settings bundled per profile: switch/clone/create/rename/export/import/delete, plus copy-the-selection-to-any-profile (Save to...).
-- **Macro recorder** — record your keystrokes from the tray menu (`InputHook`-based, keyboard-only, `Esc` stops, recorded text auto-escaped for `Send`); recordings are saved into a **global macro library**.
-- **Macros tab** — a dedicated tab managing the macro library (create/edit/delete, run once as a test, and "Assign to key..."). A key remap whose output is `macro:Name` replays the named library entry, so editing a macro updates every binding that references it. The library persists as a `[Macros]` section in `keybinds.cfg`.
+- **Key remapper** — bind a hotkey to another key or combination (`!Tab`), with a repeat form (`!Tab 2` = hold Alt, press Tab twice) full macro strings sent as-is (`{Enter}{Enter}abc`), and 1:N remaps (`zx` types `z` then `x`).
+- **Trigger kinds** — every command binding can trigger on a **hotkey**, a **hotstring** (typed text + ending character) or a **pixel** (screen pixel turns to/from a color); remaps stay hotkey-only; hotkey triggers offer interception types (`~` passthrough, `$` force hook, `*` wildcard, combinable). Bindings can be scoped to one program (`[ahk_exe chrome.exe]`).
+- **Macro Builder** — build macros one action at a time (key press/down/up with hold duration, waits, shell commands with wait-until-return, mouse moves with a held key, raw Send sequences), with named loops, per-macro trigger modes (press/release/repeat-while-held/pixel-watch), in-place Clone of the selected actions, an AHK Send action for full `Send()` syntax (Advanced mode) and a Test-run button.
+- **Profiles** — bindings, macros, repeat settings, the shell selection and (Advanced) Send modes bundled per profile: switch/clone/create/rename/export/import/delete, plus copy-the-selection-to-any-profile (Save to..., picked from a dropdown of existing profiles).
+- **Macro recorder** — record your keystrokes from the tray menu (`InputHook`-based, keyboard-only, `Esc` stops, recorded text auto-escaped for `Send`); recordings are saved into the macro library (per profile).
+- **Macros tab** — a dedicated tab managing the macro library (create/edit/delete, run once as a test, and "Assign to key..."). A key remap whose output is `macro:Name` replays the named library entry, so editing a macro updates every binding that references it. The library persists per profile as `macro:` lines in `keybinds.cfg` (a legacy `[Macros]` section is still read into the Default profile).
 - **Per-app window scoping** — append a WinTitle criterion such as `[ahk_exe chrome.exe]` to any binding to make it fire only in matching windows.
 
 **Management**
@@ -48,6 +48,9 @@ Pre-compiled binaries live in the `dist` directory (compiled via Keysharp):
 **GUI & feedback**
 
 - **Tray menu** — single-click show/hide, Save/Load, Import…/Export…, a Profiles submenu, *Record Macro…*, Exit.
+- **Suspend / Start as suspended** — the sidebar *Suspend* button pauses ALL trigger interception until unsuspended (F1, the window and the tray stay live); the Settings tab can start the app suspended, so triggers arm only after a manual unsuspend.
+- **Autosave** — optional: changes persist silently a moment after every edit.
+- **Advanced mode** — reveals the Send-mode layer: a default Send mode (per profile), per-remap Send mode overrides in the binding editor, per-action modes and the AHK Send action in the Macro Builder (Send/Input/Event/Play/InputThenPlay, doc-verified on both engines).
 - **Validated import with a confirmation gate** — imported configs are parsed fully first; malformed lines are rejected and reported; nothing activates until you choose *Yes* (activate) / *No* (import disabled) / *Cancel* (undo).
 - **Themes + auto dark/light** — `theme.cfg` with validated `RRGGBB` colors and window transparency; `Auto=1` follows the Windows dark/light app mode (Windows-only; the Keysharp port falls back to the dark preset).
 - **Repeat-while-held** — optional: remap outputs keep repeating while the bound key is physically held, with buffer/delay settings.
@@ -208,11 +211,11 @@ A *Command Mapper* action is dispatched by its first character(s):
 
 #### Shell detection + bash validation
 
-The Settings tab's *Shell for & commands* control offers the shells actually installed on the device, discovered by a detection layer (specified in `Resources/shell_detection_spec.md`, implemented mirrored in both scripts):
+The Settings tab's *Shell for & commands* control offers the shells actually installed on the device, discovered by a runtime detection layer implemented identically in both scripts, so a compiled binary finds the right shells on whichever platform it runs:
 
 - **Detected shells** (populated at startup, before the setting is read):
-  - **Windows** (the `.ahk` contains only this branch): `cmd` (always present), `powershell` (via its absolute `System32\WindowsPowerShell\v1.0` path), `pwsh` (PATH search, then `PowerShell\7` fallback), `bash` (PATH search, then Git-for-Windows standard locations). Order: cmd, powershell, pwsh, bash.
-  - **Unix** (`.ks` `#else` branch, fully dynamic): parse `/etc/shells` (the canonical list of valid login shells), keeping only entries that exist; fall back to probing `/bin/sh` and `/bin/bash` if the file is missing; dedupe by Id. The user's login shell (`SHELL` env) is listed first.
+  - **Windows**: `cmd` (always present), `powershell` (via its absolute `System32\WindowsPowerShell\v1.0` path), `pwsh` (PATH search, then `PowerShell\7` fallback), `bash` (Git Bash: Git's install paths first, labeled "Git Bash"; a PATH-found `bash.exe` excluding WSL's `System32\bash.exe`). Order: cmd, powershell, pwsh, Git Bash.
+  - **Unix** (fully dynamic): parse `/etc/shells` (the canonical list of valid login shells), keeping only entries that exist; fall back to probing `/bin/sh` and `/bin/bash` if the file is missing; dedupe by Id. The user's login shell (`SHELL` env) is listed first.
 - **Each shell entry** carries an `Id` (lowercased executable basename — this is what gets persisted), display `Name`, absolute `Path`, `ArgStyle` (`/c`, `-Command`, `-c`) and a `Family` (`cmd`, `ps`, `posix`) that decides invocation semantics.
 - **The INI setting `ShellCmd` becomes a shell Id** (`"cmd"`, `"powershell"`, `"pwsh"`, `"bash"`, `"zsh"`, `"sh"`, …). Backward compatible with the previous `"cmd"`/`"powershell"` values; if the saved Id is not among the detected shells, the first detected shell is used (and the setting updated).
 - **Bash syntax validation:** when the selected shell's Id is `bash`, `&`-commands are first written to a temp file and checked with `bash -n` via `RunWait`; a non-zero exit means the command is **not executed** — the syntax error is logged and shown in the status strip. Validation is always-on for bash (it costs milliseconds) and only for bash — other shells have incompatible syntax and could false-reject.
@@ -279,7 +282,7 @@ Built-in presets: **Dark** `1E1E1E / 2D2D2D / FFFFFF / 9E9E9E / 255` (default), 
 
 ## Usage guide
 
-> The in-app **Usage Guide tab** is the complete reference: seven scrollable pages (Getting Started, Keys & Remaps, Commands & Shells, Macros & Builder, Hotstrings & Pixel, Profiles, Window & Files) covering every feature below in more depth, including the full key-name inventory and the complete macro token grammar.
+> The in-app **Usage Guide tab** is the complete reference: seven pages (Getting Started, Keys & Remaps, Commands & Shells, Macros & Builder, Hotstrings & Pixel, Profiles, Window & Files) covering every feature below in more depth, including the full key-name inventory and the complete macro token grammar.
 
 ### GUI tour
 
@@ -435,9 +438,9 @@ Del and Ctrl+Z pass through to the focused control when a list is not focused; a
 | `keybinds.cfg` | Your bindings — the shipped example doubles as the working config, loaded from the script's folder. |
 | `zxcmcsettings.ini` | Settings file (UTF-16 with BOM; see [reference](#zxcmcsettingsini)). |
 | `theme.cfg` | Commented theme example; every key documented inline. |
-| `icons/` | Row icons for the list views — `gear.ico` (command bindings), `keyboard.ico` (key remaps), generated by `Resources/make_icons.py`. |
+| `icons/` | Row icons for the list views — `gear.ico` (command bindings), `keyboard.ico` (key remaps). |
 | `dist/` | Keysharp compile artifacts: `zxcmc.cks` (from the `.ahk`) and `zxcmc-ks.cks` (from the `.ks`). *(gitignored)* |
-| `.gitignore` | Ignores `Resources/`, `tests/` and configuration/save files |
+| `.gitignore` | Ignores local notes, test harnesses, configuration/save files and build temp files |
 
 ---
 
