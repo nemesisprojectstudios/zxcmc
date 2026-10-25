@@ -3,11 +3,14 @@
 **Zx's Crossplatform Macro Client** - cross-platform hotkey remapping, hotstrings, pixel triggers and macros, inspired by TGMacro.
 
 ZxCMC is a keyboard remapper and command launcher for power users: bind any key combination to a shell command, to another key press, or to a recorded macro, optionally scoped to a single application window. It is a single, binary-free script with no installer and no runtime dependencies beyond the interpreter — written in [AutoHotkey](https://www.autohotkey.com/) v2 syntax and shipped as several runnables: `zxcmc.ahk` (AutoHotkey v2.0, Windows-only) and `zxcmc.ks` (a mechanical mirror of the same code for [Keysharp](https://github.com/keysharp-org/Keysharp), the cross-platform .NET port, covering Windows/Linux/macOS). All bindings live in one plain-text file, `keybinds.cfg`, next to the script, and every feature is also reachable from a borderless GUI and a tray menu.  
-Pre-compiled binaries live in the `dist` directory (compiled via Keysharp):
+Pre-compiled keysharp assemblies live in the `dist` directory (compiled via Keysharp):
 - zxcmc.cks - corresponds to zxcmc.ahk
 - zxcmc-ks.cks - corresponds to zxcmc.ks
-- zxcmc-ks-noprocesspriority - corresponds to zxcmc.ks, with lines 47-50 removed, as some Linux distributions/desktop environments refuse to parse `try ProcessSetPriority("AboveNormal")` properly, which results in exceptions.
-
+Compiled binaries are pushed to **Releases** as `zxcmc-{nativeOS}-{architecture}.tar.gz` (full) and `zxcmc-{nativeOS}-{architecture}-min.tar.gz` (minimal executable)  
+Currently pushed binaries:
+- zxcmc-windows-x64.tar.gz
+- zxcmc-linux-x64.tar.gz
+After the initial release, tarballs will also be version tagged in Releases. 
 ---
 
 ## Contents
@@ -91,7 +94,6 @@ Expected files next to the script (all optional — sensible defaults apply if m
 |---|---|---|
 | `dist/zxcmc.cks` | `zxcmc.ahk` | Unchanged |
 | `dist/zxcmc-ks.cks` | `zxcmc.ks` | Unchanged |
-| `dist/zxcmc-ks-noprocesspriority.cks` | `zxcmc.ks` | Lines 47-50 removed |
 ---
 
 ## Quick start
@@ -276,7 +278,7 @@ Optional, UTF-8, `Key=Value` lines; `;` comments; unknown keys ignored. Colors a
 | `Transparency` | `255` | Window opacity, 0–255 (255 = opaque). |
 | `Auto` | `1` | `1` = follow the Windows dark/light app mode automatically (reads `HKCU\...\Themes\Personalize`, `AppsUseLightTheme`). **Windows-only** — the Keysharp port guards the registry read and falls back to the dark preset elsewhere. |
 
-Built-in presets: **Dark** `1E1E1E / 2D2D2D / FFFFFF / 9E9E9E / 255` (default), **Light** `F3F3F3 / FFFFFF / 1A1A1A / 595959 / 255` (chosen when `Auto=1` and the system uses light mode). Explicit keys override the chosen preset individually. The repo ships a fully commented `theme.cfg` with everything remarked out.
+Built-in presets: **Dark** `1E1E1E / 2D2D2D / FFFFFF / 9E9E9E / 255` (default), **Light** `F3F3F3 / FFFFFF / 1A1A1A / 595959 / 255` (chosen when `Auto=1` and the system uses light mode). Explicit keys override the chosen preset individually. The repo ships a fully commented `examples/theme-example.cfg` with everything remarked out.
 
 ---
 
