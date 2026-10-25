@@ -1,7 +1,9 @@
 Resources/
 tests/
-*.ini
-*.cfg
+keybinds.cfg
+theme.cfg
+zxcmcsettings.ini
 ANALYSIS.md
+*keysharp.md
 # atomic-save temp files
 *.tmp

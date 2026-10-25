@@ -104,7 +104,7 @@ Press **F1** at any time — in any application — to hide or show the ZxCMC wi
 
 ### An example keybinds.cfg (Windows)
 
-```ahk
+```conf
 #ESCAPE;taskmgr
 #Q;alacritty
 #Z;start zen.exe
@@ -147,7 +147,7 @@ Every line is `KEY;ACTION` — the split happens at the *first* semicolon only, 
 
 One plain-text file, UTF-8, next to the script. Read as UTF-8; written as UTF-8 **without** BOM with CRLF line endings, atomically via `keybinds.cfg.tmp` + rename.
 
-```ahk
+```conf
 ; comment lines start with a semicolon and are skipped entirely
 
 ; ---- Default profile (headerless): command bindings ----
@@ -225,7 +225,7 @@ The Settings tab's *Shell for & commands* control offers the shells actually ins
 
 Macros and the three repeat settings (`DoRepeatOutputs`, `RepeatBuffer`, `RepeatDelay`) are per-profile. They persist inside each profile section:
 
-```
+```conf
 [Profile:Work]
 set:RepeatBuffer;120
 macro:login;user{Tab}pass{Enter}
@@ -435,11 +435,9 @@ Del and Ctrl+Z pass through to the focused control when a list is not focused; a
 |---|---|
 | `zxcmc.ahk` | The canonical implementation — AutoHotkey v2.0 app for Windows (~2250 lines, class-based state, hotkey engine, GUI, tray, config I/O). |
 | `zxcmc.ks` | The Keysharp cross-platform port — a mechanical mirror of the `.ahk` plus platform branches (`#Requires capability`, `#if WINDOWS` guards, restructured UpDown controls) so the two stay diffable. |
-| `keybinds.cfg` | Your bindings — the shipped example doubles as the working config, loaded from the script's folder. |
-| `zxcmcsettings.ini` | Settings file (UTF-16 with BOM; see [reference](#zxcmcsettingsini)). |
-| `theme.cfg` | Commented theme example; every key documented inline. |
+| `examples/` | Titled examples for all sorts of configuration files that are created during runtime. |
 | `icons/` | Row icons for the list views — `gear.ico` (command bindings), `keyboard.ico` (key remaps). |
-| `dist/` | Keysharp compile artifacts: `zxcmc.cks` (from the `.ahk`) and `zxcmc-ks.cks` (from the `.ks`). *(gitignored)* |
+| `dist/` | Keysharp compile artifacts: `zxcmc.cks` (from the `.ahk`) and `zxcmc-ks.cks` (from the `.ks`). |
 | `.gitignore` | Ignores local notes, test harnesses, configuration/save files and build temp files |
 
 ---
@@ -448,7 +446,7 @@ Del and Ctrl+Z pass through to the focused control when a list is not focused; a
 
 1. **Hotkeys / InputHook / Send / GetKeyState: Full on Windows, Partial on Linux/macOS.** X11 support is broader; on Wayland, global hotkey capture and PID availability vary by compositor.
 2. **Capability prompts** on first run off-Windows (`#Requires capability InputMonitoring, InputControl, WindowMonitoring`); a denied capability exits with an error naming it.
-3. **Startup toggle off-Windows**: `FileCreateShortcut` writes a freedesktop `.desktop` launcher/symlink whose generated filename may not match the `FileExist` seeding check — the toggle's initial state may need path adjustment per platform (Windows unchanged).
+3. **Startup toggle off-Windows**: `FileCreateShortcut` writes a freedesktop `.desktop` launcher/symlink whose generated filename may not match the `FileExist` seeding check — the toggle's initial state may need path adjustment per platform (Windows works properly).
 4. **ListView theming** via Win32 LVM messages is compiled out off-Windows (GTK treeview); only the `+Background` GUI option remains.
 5. **Tooltips** (settings controls, filter boxes) are Windows-only — absent elsewhere, never fatal.
 6. **UpDown UI** differs: Keysharp UpDowns are standalone NumericUpDown controls (no buddy Edit), so the Settings tab looks slightly different in the `.ks`.
