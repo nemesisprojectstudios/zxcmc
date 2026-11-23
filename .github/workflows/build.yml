@@ -1,0 +1,102 @@
+name: build
+
+on:
+  push:
+    branches: [master, Main, Experimental]
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  # Pin the compiler: Keysharp always targets the host OS (no
+  # cross-compilation), so the matrix below provides one runner per
+  # target platform instead. Bump this to pick up a newer Keysharp.
+  KEYSHARP_VERSION: 0.0.0.18
+
+permissions:
+  contents: write
+
+jobs:
+  compile:
+    name: compile (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: keysharp-${{ env.KEYSHARP_VERSION }}-win-x64.zip
+            ext: zip
+          - os: ubuntu-latest
+            asset: keysharp-${{ env.KEYSHARP_VERSION }}-linux-x64.tar.gz
+            ext: tar
+          # macOS: Keysharp ships .dmg/.pkg installers only, and the CLI
+          # inside them has not been exercised by this project. Keep the
+          # job informational until verified manually.
+          - os: macos-latest
+            asset: keysharp-${{ env.KEYSHARP_VERSION }}-osx-x64.dmg
+            ext: dmg
+            continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+          dotnet-quality: preview
+
+      - name: Fetch Keysharp
+        shell: bash
+        run: gh release download "v${KEYSHARP_VERSION}" --repo keysharp-org/Keysharp --pattern "${{ matrix.asset }}" --dir keysharp
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Unpack Keysharp
+        shell: bash
+        run: |
+          cd keysharp
+          case "${{ matrix.ext }}" in
+            zip) unzip -q "${{ matrix.asset }}" ;;
+            tar) tar xzf "${{ matrix.asset }}" ;;
+            dmg) hdiutil attach "${{ matrix.asset }}" -nobrowse -mountpoint /Volumes/ks
+                 cp -R /Volumes/ks/* unpacked/ 2>/dev/null || true
+                 hdiutil detach /Volumes/ks ;;
+          esac
+          find . -iname 'Keysharp*' -type f
+
+      - name: Validate and compile
+        shell: bash
+        run: |
+          out="$GITHUB_WORKSPACE/dist/${{ matrix.os }}"
+          mkdir -p "$out"
+          bin="$(find keysharp -type f \( -name 'Keysharp.exe' -o -name 'Keysharp' \) | head -1)"
+          echo "compiler: $bin"
+          chmod +x "$bin" 2>/dev/null || true
+          cd "$(dirname "$bin")"
+          cli="./$(basename "$bin")"
+          "$cli" --validate "$GITHUB_WORKSPACE/zxcmc.ahk"
+          "$cli" --validate "$GITHUB_WORKSPACE/zxcmc.ks"
+          "$cli" --compile "$GITHUB_WORKSPACE/zxcmc.ahk" --dest "$out/zxcmc-${{ matrix.os }}.cks"
+          "$cli" --compile "$GITHUB_WORKSPACE/zxcmc.ks" --dest "$out/zxcmc-ks-${{ matrix.os }}.cks"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zxcmc-${{ matrix.os }}
+          path: dist/${{ matrix.os }}/*.cks
+          if-no-files-found: error
+
+  release:
+    name: attach builds to release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+
+      - name: Attach artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.cks
+          fail_on_unmatched_files: true
