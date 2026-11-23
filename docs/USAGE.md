@@ -273,4 +273,4 @@ The tray icon is the fastest way to work with ZxCMC in the background:
 ---
 
 *All screens described above correspond to Keysharp v0.0.0.18 as of ZxCMC
-v0.2.0-beta.*
+v0.1.0-beta.*

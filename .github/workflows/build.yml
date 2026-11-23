@@ -29,22 +29,19 @@ jobs:
           - os: windows-latest
             asset: keysharp-0.0.0.18-win-x64.zip
             ext: zip
-            bin: Keysharp.exe
             exeext: .exe
             pkg: zip
           - os: ubuntu-latest
             asset: keysharp-0.0.0.18-linux-x64.tar.gz
             ext: tar
-            bin: Keysharp
             exeext: ''
             pkg: tar.gz
           # macOS: Keysharp ships .dmg/.pkg installers only, and the CLI
           # inside them has not been exercised by this project. Keep the
           # job informational until verified manually.
           - os: macos-latest
-            asset: keysharp-0.0.0.18-osx-x64.dmg
+            asset: keysharp-0.0.0.18-osx-arm64.dmg
             ext: dmg
-            bin: Keysharp
             exeext: ''
             pkg: tar.gz
             continue-on-error: true
@@ -70,7 +67,8 @@ jobs:
             zip) unzip -q "${{ matrix.asset }}" ;;
             tar) tar xzf "${{ matrix.asset }}" ;;
             dmg) hdiutil attach "${{ matrix.asset }}" -nobrowse -mountpoint /Volumes/ks
-                 cp -R /Volumes/ks/* unpacked/ 2>/dev/null || true
+                 mkdir -p unpacked
+                 cp -R /Volumes/ks/. unpacked/
                  hdiutil detach /Volumes/ks ;;
           esac
           find . -iname 'Keysharp*' -type f
@@ -80,7 +78,12 @@ jobs:
         run: |
           out="$GITHUB_WORKSPACE/dist/${{ matrix.os }}"
           mkdir -p "$out/asm" "$out/exe" "$out/exe-min"
-          bin="$(find keysharp -type f \( -name 'Keysharp.exe' -o -name 'Keysharp' \) | head -1)"
+          bin="$(find keysharp -type f \( -name 'Keysharp.exe' -o -iname 'keysharp' \) | head -1)"
+          if [ -z "$bin" ]; then
+            echo "Keysharp binary not found under keysharp/:" >&2
+            find keysharp -maxdepth 7 -type f | head -60 >&2
+            exit 1
+          fi
           echo "compiler: $bin"
           chmod +x "$bin" 2>/dev/null || true
           cd "$(dirname "$bin")"
