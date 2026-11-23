@@ -15,7 +15,10 @@ Compiled `.cks` assemblies are **not committed** to the repository; they are bui
 
 Keysharp is a .NET-based reimplementation of AutoHotkey v2 (currently targeting v2.1-alpha.37 as of Keysharp 0.0.0.18) and requires the **.NET 10 runtime**. Per its own README it is under active development and **not yet recommended for production**; Windows has the broadest compatibility.
 
-Pre-built binaries are attached to GitHub **Releases**, produced for every tagged commit by [GitHub Actions](.github/workflows/build.yml) on one runner per target OS (Keysharp cannot cross-compile): per-platform `.cks` assemblies of both sources (`zxcmc-<os>.cks`, `zxcmc-ks-<os>.cks`), plus **full** standalone builds (`zxcmc-<os>-full.*` — executable + all required DLLs, bundled as a tar.gz or zip) and **minimal** standalone builds (`zxcmc-<os>-min.*`, same shape, smaller).
+Pre-built binaries are attached to GitHub **Releases**, produced for every tagged commit (`v*`) by [GitHub Actions](.github/workflows/build.yml), version-stamped with the tag (e.g. `v0.1.0-beta`):
+
+- **Assemblies** (compiled once on Windows — Keysharp `.cks` output is platform-independent and cross-compatible): `zxcmc-ks-<tag>.cks` (the cross-platform Keysharp source) and `zxcmc-ahk-<tag>.cks` (the Windows-oriented `.ahk`; it runs through Keysharp on other platforms but is not designed for them).
+- **Standalone binaries** (one runner per target OS, since Keysharp cannot cross-compile): `zxcmc-full-{linux,windows,macos}-<tag>.{tar.gz,zip}` — executables of both sources plus all required runtime DLLs — and `zxcmc-min-{linux,windows,macos}-<tag>.{tar.gz,zip}`, the minimal standalone build, same shape.
 
 ---
 

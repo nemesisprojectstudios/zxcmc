@@ -8,8 +8,8 @@ on:
 
 env:
   # Pin the compiler: Keysharp always targets the host OS (no
-  # cross-compilation), so the matrix below provides one runner per
-  # target platform instead. Bump this to pick up a newer Keysharp.
+  # cross-compilation), so the standalone binaries below need one runner
+  # per target platform. Bump this to pick up a newer Keysharp.
   # NOTE: the matrix asset names below must be updated in the same
   # commit (the env context is not available in matrix definitions).
   KEYSHARP_VERSION: 0.0.0.18
@@ -18,8 +18,86 @@ permissions:
   contents: write
 
 jobs:
-  compile:
-    name: compile (${{ matrix.os }})
+  # Keysharp .cks assemblies are platform-independent and
+  # cross-compatible, so they are compiled exactly once per release, on
+  # Windows - the only platform the .ahk source is designed for.
+  assemblies:
+    name: assemblies
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+          dotnet-quality: preview
+
+      - name: Fetch Keysharp
+        shell: bash
+        run: gh release download "v${KEYSHARP_VERSION}" --repo keysharp-org/Keysharp --pattern "keysharp-0.0.0.18-win-x64.zip" --dir keysharp
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Unpack Keysharp
+        shell: bash
+        run: |
+          cd keysharp
+          unzip -q keysharp-0.0.0.18-win-x64.zip
+
+      - name: Validate and compile assemblies
+        shell: bash
+        run: |
+          out="$GITHUB_WORKSPACE/assemblies"
+          mkdir -p "$out"
+          bin="$(find keysharp -type f -name Keysharp.exe | head -1)"
+          [ -z "$bin" ] && { find keysharp -maxdepth 4 -type f >&2; exit 1; }
+          chmod +x "$bin"
+          cd "$(dirname "$bin")"
+          cli="./$(basename "$bin")"
+          "$cli" --validate "$GITHUB_WORKSPACE/zxcmc.ahk"
+          "$cli" --validate "$GITHUB_WORKSPACE/zxcmc.ks"
+          "$cli" --compile asm --dest "$out/zxcmc-ks-${{ github.ref_name }}.cks" "$GITHUB_WORKSPACE/zxcmc.ks"
+          "$cli" --compile asm --dest "$out/zxcmc-ahk-${{ github.ref_name }}.cks" "$GITHUB_WORKSPACE/zxcmc.ahk" 
+
+      - name: Attach assemblies to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ github.ref_name }}"
+          repo="${{ github.repository }}"
+          if ! gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
+            gh release create "$tag" --repo "$repo" --target "${{ github.sha }}" \
+              --title "ZxCMC $tag" \
+              --notes "Automated builds of $tag (Keysharp $KEYSHARP_VERSION)." || true
+          fi
+          # rebuild semantics: replace every existing release asset
+          for id in $(gh api "repos/$repo/releases/tags/$tag" --jq '.assets[].id'); do
+            gh api -X DELETE "repos/$repo/releases/assets/$id" >/dev/null || true
+          done
+          files="$(find assemblies -type f -name '*.cks')"
+          echo "uploading:"; echo "$files"
+          for i in 1 2 3 4 5; do
+            gh release upload "$tag" $files --clobber --repo "$repo" && break
+            [ "$i" = 5 ] && exit 1
+            sleep 15
+          done
+
+      - name: Upload assemblies artifact (branch builds)
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: zxcmc-assemblies
+          path: assemblies/*.cks
+          if-no-files-found: error
+          retention-days: 7
+
+  binaries:
+    name: binaries (${{ matrix.slug }})
+    needs: [assemblies]
+    if: ${{ !cancelled() && needs.assemblies.result == 'success' }}
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.continue-on-error == true }}
     strategy:
@@ -27,11 +105,13 @@ jobs:
       matrix:
         include:
           - os: windows-latest
+            slug: windows
             asset: keysharp-0.0.0.18-win-x64.zip
             ext: zip
             exeext: .exe
             pkg: zip
           - os: ubuntu-latest
+            slug: linux
             asset: keysharp-0.0.0.18-linux-x64.tar.gz
             ext: tar
             exeext: ''
@@ -40,6 +120,7 @@ jobs:
           # inside them has not been exercised by this project. Keep the
           # job informational until verified manually.
           - os: macos-latest
+            slug: macos
             asset: keysharp-0.0.0.18-osx-arm64.dmg
             ext: dmg
             exeext: ''
@@ -74,13 +155,12 @@ jobs:
                  # expand it to reach the bundled .app / CLI
                  pkgutil --expand-full "unpacked/Install Keysharp.pkg" installer ;;
           esac
-          find . -iname 'Keysharp*' -type f
 
       - name: Validate and compile
         shell: bash
         run: |
-          out="$GITHUB_WORKSPACE/dist/${{ matrix.os }}"
-          mkdir -p "$out/asm" "$out/exe" "$out/exe-min"
+          out="dist/${{ matrix.slug }}"
+          mkdir -p "$out"
           bin="$(find keysharp -type f -name Keysharp.exe | head -1)"
           [ -z "$bin" ] && bin="$(find keysharp -type f -name keysharp | head -1)"
           [ -z "$bin" ] && bin="$(find keysharp -type f -iname keysharp | head -1)"
@@ -89,61 +169,34 @@ jobs:
             find keysharp -maxdepth 7 -type f | head -60 >&2
             exit 1
           fi
-          echo "compiler: $bin"
-          chmod +x "$bin" 2>/dev/null || true
+          chmod +x "$bin"
           cd "$(dirname "$bin")"
           cli="./$(basename "$bin")"
-
-          # early-failure: both sources must parse before anything is built
           "$cli" --validate "$GITHUB_WORKSPACE/zxcmc.ahk"
           "$cli" --validate "$GITHUB_WORKSPACE/zxcmc.ks"
-
-          # asm: .cks assembly, uploaded as-is; exe / exe-min: standalone
-          # executable + all DLLs dumped into the target folder
           for src in zxcmc.ahk zxcmc.ks; do
             case "$src" in
               zxcmc.ahk) name="zxcmc" ;;
               zxcmc.ks)  name="zxcmc-ks" ;;
             esac
-            "$cli" --compile asm     --dest "$out/asm/${name}-${{ matrix.os }}.cks" "$GITHUB_WORKSPACE/$src"
-            "$cli" --compile exe     --dest "$out/exe/$name/${name}${{ matrix.exeext }}" "$GITHUB_WORKSPACE/$src"
-            "$cli" --compile exe-min --dest "$out/exe-min/$name/${name}${{ matrix.exeext }}" "$GITHUB_WORKSPACE/$src"
+            "$cli" --compile exe     --dest "$GITHUB_WORKSPACE/$out/exe/$name/${name}${{ matrix.exeext }}" "$GITHUB_WORKSPACE/$src"
+            "$cli" --compile exe-min --dest "$GITHUB_WORKSPACE/$out/exe-min/$name/${name}${{ matrix.exeext }}" "$GITHUB_WORKSPACE/$src"
+            cd "$GITHUB_WORKSPACE"
           done
 
-      - name: Package executables (zip)
-        if: matrix.pkg == 'zip'
-        shell: pwsh
-        run: |
-          $out = "dist/${{ matrix.os }}"
-          Compress-Archive -Path "$out/exe/*" -DestinationPath "$out/zxcmc-${{ matrix.os }}-full.zip"
-          Compress-Archive -Path "$out/exe-min/*" -DestinationPath "$out/zxcmc-${{ matrix.os }}-min.zip"
-
-      - name: Package executables (tar.gz)
-        if: matrix.pkg == 'tar.gz'
+      - name: Package executables
         shell: bash
         run: |
-          out="dist/${{ matrix.os }}"
-          tar -czf "$out/zxcmc-${{ matrix.os }}-full.tar.gz" -C "$out/exe" .
-          tar -czf "$out/zxcmc-${{ matrix.os }}-min.tar.gz"  -C "$out/exe-min" .
+          out="dist/${{ matrix.slug }}"
+          case "${{ matrix.pkg }}" in
+            zip) pwsh -NoProfile -Command "Compress-Archive -Path '$out/exe/*' -DestinationPath '$out/zxcmc-full-${{ matrix.slug }}-${{ github.ref_name }}.zip'; Compress-Archive -Path '$out/exe-min/*' -DestinationPath '$out/zxcmc-min-${{ matrix.slug }}-${{ github.ref_name }}.zip'" ;;
+            *)   tar -czf "$out/zxcmc-full-${{ matrix.slug }}-${{ github.ref_name }}.tar.gz" -C "$out/exe" .
+                 tar -czf "$out/zxcmc-min-${{ matrix.slug }}-${{ github.ref_name }}.tar.gz"  -C "$out/exe-min" . ;;
+          esac
+          rm -rf "$out/exe" "$out/exe-min"
+          ls -R "$out" 
 
-      - name: Clean staging folders
-        shell: bash
-        run: rm -rf dist/${{ matrix.os }}/exe dist/${{ matrix.os }}/exe-min && ls -R dist/${{ matrix.os }}
-
-      # Branch runs only publish the tiny .cks assemblies as artifacts.
-      # Tag runs skip artifacts entirely (they count against Actions
-      # storage quota) and attach everything directly to the release
-      # below instead - release assets are not quota-billed.
-      - uses: actions/upload-artifact@v4
-        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
-        continue-on-error: true
-        with:
-          name: zxcmc-${{ matrix.os }}-cks
-          path: dist/${{ matrix.os }}/**/*.cks
-          if-no-files-found: error
-          retention-days: 7
-
-      - name: Attach builds to the release
+      - name: Attach binaries to the release
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
         env:
@@ -154,14 +207,12 @@ jobs:
           if ! gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
             gh release create "$tag" --repo "$repo" --target "${{ github.sha }}" \
               --title "ZxCMC $tag" \
-              --notes "Automated per-OS builds of commit ${{ github.sha }} (Keysharp $KEYSHARP_VERSION)." || true
+              --notes "Automated builds of $tag (Keysharp $KEYSHARP_VERSION)." || true
           fi
-          # file list via find: shell globs abort the command when one
-          # pattern (e.g. the other OS's extension) matches nothing
-          files="$(find "dist/${{ matrix.os }}" -type f \( -name '*.cks' -o -name '*.zip' -o -name '*.tar.gz' \))"
+          files="$(find "dist/${{ matrix.slug }}" -type f \( -name '*.zip' -o -name '*.tar.gz' \))"
           echo "uploading:"; echo "$files"
           for i in 1 2 3 4 5; do
             gh release upload "$tag" $files --clobber --repo "$repo" && break
             [ "$i" = 5 ] && exit 1
-            sleep 15   # other matrix jobs may be creating the release concurrently
+            sleep 15
           done
