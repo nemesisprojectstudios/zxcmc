@@ -69,7 +69,10 @@ jobs:
             dmg) hdiutil attach "${{ matrix.asset }}" -nobrowse -mountpoint /Volumes/ks
                  mkdir -p unpacked
                  cp -R /Volumes/ks/. unpacked/
-                 hdiutil detach /Volumes/ks ;;
+                 hdiutil detach /Volumes/ks
+                 # the dmg ships an installer .pkg, not the app itself:
+                 # expand it to reach the bundled .app / CLI
+                 pkgutil --expand-full "unpacked/Install Keysharp.pkg" installer ;;
           esac
           find . -iname 'Keysharp*' -type f
 
@@ -78,7 +81,9 @@ jobs:
         run: |
           out="$GITHUB_WORKSPACE/dist/${{ matrix.os }}"
           mkdir -p "$out/asm" "$out/exe" "$out/exe-min"
-          bin="$(find keysharp -type f \( -name 'Keysharp.exe' -o -iname 'keysharp' \) | head -1)"
+          bin="$(find keysharp -type f -name Keysharp.exe | head -1)"
+          [ -z "$bin" ] && bin="$(find keysharp -type f -name keysharp | head -1)"
+          [ -z "$bin" ] && bin="$(find keysharp -type f -iname keysharp | head -1)"
           if [ -z "$bin" ]; then
             echo "Keysharp binary not found under keysharp/:" >&2
             find keysharp -maxdepth 7 -type f | head -60 >&2
@@ -151,9 +156,12 @@ jobs:
               --title "ZxCMC $tag" \
               --notes "Automated per-OS builds of commit ${{ github.sha }} (Keysharp $KEYSHARP_VERSION)." || true
           fi
+          # file list via find: shell globs abort the command when one
+          # pattern (e.g. the other OS's extension) matches nothing
+          files="$(find "dist/${{ matrix.os }}" -type f \( -name '*.cks' -o -name '*.zip' -o -name '*.tar.gz' \))"
+          echo "uploading:"; echo "$files"
           for i in 1 2 3 4 5; do
-            gh release upload "$tag" dist/${{ matrix.os }}/**/*.cks dist/${{ matrix.os }}/*.zip dist/${{ matrix.os }}/*.tar.gz \
-              --clobber --repo "$repo" && break
+            gh release upload "$tag" $files --clobber --repo "$repo" && break
             [ "$i" = 5 ] && exit 1
             sleep 15   # other matrix jobs may be creating the release concurrently
           done
