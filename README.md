@@ -15,7 +15,7 @@ Compiled `.cks` assemblies are **not committed** to the repository; they are bui
 
 Keysharp is a .NET-based reimplementation of AutoHotkey v2 (currently targeting v2.1-alpha.37 as of Keysharp 0.0.0.18) and requires the **.NET 10 runtime**. Per its own README it is under active development and **not yet recommended for production**; Windows has the broadest compatibility.
 
-Pre-built assemblies are attached to GitHub **Releases** as CI-built `.cks` files named per platform (e.g. `zxcmc-windows-latest.cks`), produced for every tagged version.
+Pre-built binaries are attached to GitHub **Releases**, produced for every tagged commit by [GitHub Actions](.github/workflows/build.yml) on one runner per target OS (Keysharp cannot cross-compile): per-platform `.cks` assemblies of both sources (`zxcmc-<os>.cks`, `zxcmc-ks-<os>.cks`), plus **full** standalone builds (`zxcmc-<os>-full.*` — executable + all required DLLs, bundled as a tar.gz or zip) and **minimal** standalone builds (`zxcmc-<os>-min.*`, same shape, smaller).
 
 ---
 
@@ -231,14 +231,18 @@ verify a release build.
 
 Compiled `.cks` assemblies are produced by [GitHub Actions](.github/workflows/build.yml) rather than committed: Keysharp always compiles for the OS it runs on (no cross-compilation), so the workflow runs the same steps on Windows, Linux and macOS runners — download Keysharp `${{ env.KEYSHARP_VERSION }}` (pinned via the `KEYSHARP_VERSION` env var in the workflow), `--validate` both scripts, then `--compile` each with `--dest` into per-OS artifacts. Tag pushes (`v*`) attach the artifacts to the GitHub Release.
 
-You can do the same manually on any platform with [Keysharp](https://github.com/keysharp-org/Keysharp/releases) and the .NET 10 runtime installed:
+You can do the same manually on any platform with [Keysharp](https://github.com/keysharp-org/Keysharp/releases) and the .NET 10 runtime installed — the workflow uses all three compile modes:
 
 ```sh
-keysharp --validate zxcmc.ahk
-keysharp --compile zxcmc.ahk --dest zxcmc.cks
+keysharp --validate zxcmc.ahk                          # parse check (exit 0 = clean)
+keysharp --compile asm     --dest zxcmc.cks   zxcmc.ahk   # .cks assembly
+keysharp --compile exe     --dest out/zxcmc   zxcmc.ahk   # standalone + all DLLs
+keysharp --compile exe-min --dest out/zxcmc   zxcmc.ahk   # minimal standalone + DLLs
 ```
 
-To validate syntax without launching the GUI: `keysharp --validate <script>` (exit code 0 means it parses cleanly), or (Windows/AutoHotkey) `AutoHotkey.exe /Validate /ErrorStdOut zxcmc.ahk`.
+With a file `--dest` the output is named after the target; with a folder `--dest` it is named after the source script. Executable outputs (plain binary on Linux/macOS, `.exe` on Windows) dump their DLLs into the target folder, ready to be bundled as tar.gz/zip.
+
+To validate syntax without launching the GUI: `keysharp --validate <script>`, or (Windows/AutoHotkey) `AutoHotkey.exe /Validate /ErrorStdOut zxcmc.ahk`.
 
 ---
 

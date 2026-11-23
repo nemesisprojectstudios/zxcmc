@@ -26,15 +26,24 @@ jobs:
           - os: windows-latest
             asset: keysharp-${{ env.KEYSHARP_VERSION }}-win-x64.zip
             ext: zip
+            bin: Keysharp.exe
+            exeext: .exe
+            pkg: zip
           - os: ubuntu-latest
             asset: keysharp-${{ env.KEYSHARP_VERSION }}-linux-x64.tar.gz
             ext: tar
+            bin: Keysharp
+            exeext: ''
+            pkg: tar.gz
           # macOS: Keysharp ships .dmg/.pkg installers only, and the CLI
           # inside them has not been exercised by this project. Keep the
           # job informational until verified manually.
           - os: macos-latest
             asset: keysharp-${{ env.KEYSHARP_VERSION }}-osx-x64.dmg
             ext: dmg
+            bin: Keysharp
+            exeext: ''
+            pkg: tar.gz
             continue-on-error: true
     steps:
       - uses: actions/checkout@v4
@@ -67,21 +76,53 @@ jobs:
         shell: bash
         run: |
           out="$GITHUB_WORKSPACE/dist/${{ matrix.os }}"
-          mkdir -p "$out"
+          mkdir -p "$out/asm" "$out/exe" "$out/exe-min"
           bin="$(find keysharp -type f \( -name 'Keysharp.exe' -o -name 'Keysharp' \) | head -1)"
           echo "compiler: $bin"
           chmod +x "$bin" 2>/dev/null || true
           cd "$(dirname "$bin")"
           cli="./$(basename "$bin")"
+
+          # early-failure: both sources must parse before anything is built
           "$cli" --validate "$GITHUB_WORKSPACE/zxcmc.ahk"
           "$cli" --validate "$GITHUB_WORKSPACE/zxcmc.ks"
-          "$cli" --compile "$GITHUB_WORKSPACE/zxcmc.ahk" --dest "$out/zxcmc-${{ matrix.os }}.cks"
-          "$cli" --compile "$GITHUB_WORKSPACE/zxcmc.ks" --dest "$out/zxcmc-ks-${{ matrix.os }}.cks"
+
+          # asm: .cks assembly, uploaded as-is; exe / exe-min: standalone
+          # executable + all DLLs dumped into the target folder
+          for src in zxcmc.ahk zxcmc.ks; do
+            case "$src" in
+              zxcmc.ahk) name="zxcmc" ;;
+              zxcmc.ks)  name="zxcmc-ks" ;;
+            esac
+            "$cli" --compile asm     --dest "$out/asm/${name}-${{ matrix.os }}.cks" "$GITHUB_WORKSPACE/$src"
+            "$cli" --compile exe     --dest "$out/exe/$name/${name}${{ matrix.exeext }}" "$GITHUB_WORKSPACE/$src"
+            "$cli" --compile exe-min --dest "$out/exe-min/$name/${name}${{ matrix.exeext }}" "$GITHUB_WORKSPACE/$src"
+          done
+
+      - name: Package executables (zip)
+        if: matrix.pkg == 'zip'
+        shell: pwsh
+        run: |
+          $out = "dist/${{ matrix.os }}"
+          Compress-Archive -Path "$out/exe/*" -DestinationPath "$out/zxcmc-${{ matrix.os }}-full.zip"
+          Compress-Archive -Path "$out/exe-min/*" -DestinationPath "$out/zxcmc-${{ matrix.os }}-min.zip"
+
+      - name: Package executables (tar.gz)
+        if: matrix.pkg == 'tar.gz'
+        shell: bash
+        run: |
+          out="dist/${{ matrix.os }}"
+          tar -czf "$out/zxcmc-${{ matrix.os }}-full.tar.gz" -C "$out/exe" .
+          tar -czf "$out/zxcmc-${{ matrix.os }}-min.tar.gz"  -C "$out/exe-min" .
+
+      - name: Clean staging folders
+        shell: bash
+        run: rm -rf dist/${{ matrix.os }}/exe dist/${{ matrix.os }}/exe-min && ls -R dist/${{ matrix.os }}
 
       - uses: actions/upload-artifact@v4
         with:
           name: zxcmc-${{ matrix.os }}
-          path: dist/${{ matrix.os }}/*.cks
+          path: dist/${{ matrix.os }}/*
           if-no-files-found: error
 
   release:
@@ -98,5 +139,8 @@ jobs:
       - name: Attach artifacts
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.cks
+          files: |
+            dist/*.cks
+            dist/*.zip
+            dist/*.tar.gz
           fail_on_unmatched_files: true
