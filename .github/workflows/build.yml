@@ -73,7 +73,8 @@ jobs:
               --notes "Automated builds of $tag (Keysharp $KEYSHARP_VERSION)." || true
           fi
           # rebuild semantics: replace every existing release asset
-          for id in $(gh api "repos/$repo/releases/tags/$tag" --jq '.assets[].id'); do
+          # (list all releases, incl. drafts - the /tags lookup misses them)
+          for id in $(gh api "repos/$repo/releases" --paginate --jq ".[] | select(.tag_name == \"$tag\") | .assets[].id"); do
             gh api -X DELETE "repos/$repo/releases/assets/$id" >/dev/null || true
           done
           files="$(find assemblies -type f -name '*.cks')"
