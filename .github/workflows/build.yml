@@ -181,7 +181,6 @@ jobs:
             esac
             "$cli" --compile exe     --dest "$GITHUB_WORKSPACE/$out/exe/$name/${name}${{ matrix.exeext }}" "$GITHUB_WORKSPACE/$src"
             "$cli" --compile exe-min --dest "$GITHUB_WORKSPACE/$out/exe-min/$name/${name}${{ matrix.exeext }}" "$GITHUB_WORKSPACE/$src"
-            cd "$GITHUB_WORKSPACE"
           done
 
       - name: Package executables
