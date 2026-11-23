@@ -21,6 +21,7 @@ jobs:
   compile:
     name: compile (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.continue-on-error == true }}
     strategy:
       fail-fast: false
       matrix:
@@ -121,10 +122,26 @@ jobs:
         shell: bash
         run: rm -rf dist/${{ matrix.os }}/exe dist/${{ matrix.os }}/exe-min && ls -R dist/${{ matrix.os }}
 
+      # Branch runs only publish the tiny .cks assemblies; the heavy
+      # exe/DLL archives are uploaded on tag runs, where the release job
+      # consumes them. Upload failures (storage quota) must not mask the
+      # compile result on branch builds.
       - uses: actions/upload-artifact@v4
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        continue-on-error: true
         with:
-          name: zxcmc-${{ matrix.os }}
-          path: dist/${{ matrix.os }}/*
+          name: zxcmc-${{ matrix.os }}-cks
+          path: dist/${{ matrix.os }}/*.cks
+          if-no-files-found: error
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: zxcmc-${{ matrix.os }}-bin
+          path: |
+            dist/${{ matrix.os }}/*.zip
+            dist/${{ matrix.os }}/*.tar.gz
           if-no-files-found: error
 
   release:
