@@ -122,10 +122,10 @@ jobs:
         shell: bash
         run: rm -rf dist/${{ matrix.os }}/exe dist/${{ matrix.os }}/exe-min && ls -R dist/${{ matrix.os }}
 
-      # Branch runs only publish the tiny .cks assemblies; the heavy
-      # exe/DLL archives are uploaded on tag runs, where the release job
-      # consumes them. Upload failures (storage quota) must not mask the
-      # compile result on branch builds.
+      # Branch runs only publish the tiny .cks assemblies as artifacts.
+      # Tag runs skip artifacts entirely (they count against Actions
+      # storage quota) and attach everything directly to the release
+      # below instead - release assets are not quota-billed.
       - uses: actions/upload-artifact@v4
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         continue-on-error: true
@@ -135,31 +135,22 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - uses: actions/upload-artifact@v4
+      - name: Attach builds to the release
         if: startsWith(github.ref, 'refs/tags/v')
-        with:
-          name: zxcmc-${{ matrix.os }}-bin
-          path: |
-            dist/${{ matrix.os }}/*.zip
-            dist/${{ matrix.os }}/*.tar.gz
-          if-no-files-found: error
-
-  release:
-    name: attach builds to release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: compile
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          merge-multiple: true
-          path: dist
-
-      - name: Attach artifacts
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/*.cks
-            dist/*.zip
-            dist/*.tar.gz
-          fail_on_unmatched_files: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ github.ref_name }}"
+          repo="${{ github.repository }}"
+          if ! gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
+            gh release create "$tag" --repo "$repo" --target "${{ github.sha }}" \
+              --title "ZxCMC $tag" \
+              --notes "Automated per-OS builds of commit ${{ github.sha }} (Keysharp $KEYSHARP_VERSION)." || true
+          fi
+          for i in 1 2 3 4 5; do
+            gh release upload "$tag" dist/${{ matrix.os }}/**/*.cks dist/${{ matrix.os }}/*.zip dist/${{ matrix.os }}/*.tar.gz \
+              --clobber --repo "$repo" && break
+            [ "$i" = 5 ] && exit 1
+            sleep 15   # other matrix jobs may be creating the release concurrently
+          done
