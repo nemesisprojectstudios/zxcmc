@@ -1,0 +1,156 @@
+name: build
+
+on:
+  push:
+    branches: [master, Main, Experimental]
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  # Pin the compiler: Keysharp always targets the host OS (no
+  # cross-compilation), so the matrix below provides one runner per
+  # target platform instead. Bump this to pick up a newer Keysharp.
+  # NOTE: the matrix asset names below must be updated in the same
+  # commit (the env context is not available in matrix definitions).
+  KEYSHARP_VERSION: 0.0.0.18
+
+permissions:
+  contents: write
+
+jobs:
+  compile:
+    name: compile (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.continue-on-error == true }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: keysharp-0.0.0.18-win-x64.zip
+            ext: zip
+            bin: Keysharp.exe
+            exeext: .exe
+            pkg: zip
+          - os: ubuntu-latest
+            asset: keysharp-0.0.0.18-linux-x64.tar.gz
+            ext: tar
+            bin: Keysharp
+            exeext: ''
+            pkg: tar.gz
+          # macOS: Keysharp ships .dmg/.pkg installers only, and the CLI
+          # inside them has not been exercised by this project. Keep the
+          # job informational until verified manually.
+          - os: macos-latest
+            asset: keysharp-0.0.0.18-osx-x64.dmg
+            ext: dmg
+            bin: Keysharp
+            exeext: ''
+            pkg: tar.gz
+            continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+          dotnet-quality: preview
+
+      - name: Fetch Keysharp
+        shell: bash
+        run: gh release download "v${KEYSHARP_VERSION}" --repo keysharp-org/Keysharp --pattern "${{ matrix.asset }}" --dir keysharp
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Unpack Keysharp
+        shell: bash
+        run: |
+          cd keysharp
+          case "${{ matrix.ext }}" in
+            zip) unzip -q "${{ matrix.asset }}" ;;
+            tar) tar xzf "${{ matrix.asset }}" ;;
+            dmg) hdiutil attach "${{ matrix.asset }}" -nobrowse -mountpoint /Volumes/ks
+                 cp -R /Volumes/ks/* unpacked/ 2>/dev/null || true
+                 hdiutil detach /Volumes/ks ;;
+          esac
+          find . -iname 'Keysharp*' -type f
+
+      - name: Validate and compile
+        shell: bash
+        run: |
+          out="$GITHUB_WORKSPACE/dist/${{ matrix.os }}"
+          mkdir -p "$out/asm" "$out/exe" "$out/exe-min"
+          bin="$(find keysharp -type f \( -name 'Keysharp.exe' -o -name 'Keysharp' \) | head -1)"
+          echo "compiler: $bin"
+          chmod +x "$bin" 2>/dev/null || true
+          cd "$(dirname "$bin")"
+          cli="./$(basename "$bin")"
+
+          # early-failure: both sources must parse before anything is built
+          "$cli" --validate "$GITHUB_WORKSPACE/zxcmc.ahk"
+          "$cli" --validate "$GITHUB_WORKSPACE/zxcmc.ks"
+
+          # asm: .cks assembly, uploaded as-is; exe / exe-min: standalone
+          # executable + all DLLs dumped into the target folder
+          for src in zxcmc.ahk zxcmc.ks; do
+            case "$src" in
+              zxcmc.ahk) name="zxcmc" ;;
+              zxcmc.ks)  name="zxcmc-ks" ;;
+            esac
+            "$cli" --compile asm     --dest "$out/asm/${name}-${{ matrix.os }}.cks" "$GITHUB_WORKSPACE/$src"
+            "$cli" --compile exe     --dest "$out/exe/$name/${name}${{ matrix.exeext }}" "$GITHUB_WORKSPACE/$src"
+            "$cli" --compile exe-min --dest "$out/exe-min/$name/${name}${{ matrix.exeext }}" "$GITHUB_WORKSPACE/$src"
+          done
+
+      - name: Package executables (zip)
+        if: matrix.pkg == 'zip'
+        shell: pwsh
+        run: |
+          $out = "dist/${{ matrix.os }}"
+          Compress-Archive -Path "$out/exe/*" -DestinationPath "$out/zxcmc-${{ matrix.os }}-full.zip"
+          Compress-Archive -Path "$out/exe-min/*" -DestinationPath "$out/zxcmc-${{ matrix.os }}-min.zip"
+
+      - name: Package executables (tar.gz)
+        if: matrix.pkg == 'tar.gz'
+        shell: bash
+        run: |
+          out="dist/${{ matrix.os }}"
+          tar -czf "$out/zxcmc-${{ matrix.os }}-full.tar.gz" -C "$out/exe" .
+          tar -czf "$out/zxcmc-${{ matrix.os }}-min.tar.gz"  -C "$out/exe-min" .
+
+      - name: Clean staging folders
+        shell: bash
+        run: rm -rf dist/${{ matrix.os }}/exe dist/${{ matrix.os }}/exe-min && ls -R dist/${{ matrix.os }}
+
+      # Branch runs only publish the tiny .cks assemblies as artifacts.
+      # Tag runs skip artifacts entirely (they count against Actions
+      # storage quota) and attach everything directly to the release
+      # below instead - release assets are not quota-billed.
+      - uses: actions/upload-artifact@v4
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        continue-on-error: true
+        with:
+          name: zxcmc-${{ matrix.os }}-cks
+          path: dist/${{ matrix.os }}/**/*.cks
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Attach builds to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ github.ref_name }}"
+          repo="${{ github.repository }}"
+          if ! gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
+            gh release create "$tag" --repo "$repo" --target "${{ github.sha }}" \
+              --title "ZxCMC $tag" \
+              --notes "Automated per-OS builds of commit ${{ github.sha }} (Keysharp $KEYSHARP_VERSION)." || true
+          fi
+          for i in 1 2 3 4 5; do
+            gh release upload "$tag" dist/${{ matrix.os }}/**/*.cks dist/${{ matrix.os }}/*.zip dist/${{ matrix.os }}/*.tar.gz \
+              --clobber --repo "$repo" && break
+            [ "$i" = 5 ] && exit 1
+            sleep 15   # other matrix jobs may be creating the release concurrently
+          done

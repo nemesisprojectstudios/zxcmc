@@ -88,6 +88,10 @@ class App {
     static UndoStack := []           ; max 10 snapshots: {Profile, Bindings, Macros}
     static IsDirty := false
     static Suspended := false   ; custom suspend: triggers not intercepted (F1/window/tray stay live)
+    static HasXC := false        ; engine supports container-relative xc/yc (Keysharp); plain AutoHotkey v2 does not
+    static TabOrigins := Map()   ; tab name -> [displayAreaX, displayAreaY] in client coords (plain AHK v2 only)
+    static CurTab := ""          ; which tab container the next XC()/YC() call resolves against
+    static PhantomProfiles := Map() ; profiles restored from the INI but absent from the cfg (never persisted while empty)
     ; // ExitConfirmed removed - written in ExitFunc but never read
     static CTab := 1
     static MainGui := 0
@@ -187,9 +191,12 @@ InitApp() {
     report := []
     LoadConfig(App.ConfigFile, &report)
     ; ! hand-edited cfg damage is reported at launch too - but never
-    ;   under --silent, where a modal dialog would block invisibly
+    ;   as a modal dialog when the window is hidden (it would block
+    ;   invisibly): unseen loads get a tray notification instead
     if (App.Settings["GuiVisible"])
         ShowCfgReport(report)
+    else if (report.Length > 0)
+        TrayTip(report.Length " config line(s) were rejected - see error.log", App.Name, "Icon!")
     ; * start-as-suspended: seed the flag BEFORE the GUI build so the
     ;   Suspend button shows the right caption; F1/tray stay live
     ;   (RegisterAppHotkeys runs after this)
@@ -916,6 +923,7 @@ RunViaShell(shell, rest, hidden) {
 ; decides (security review F3).
 LoadConfig(file, &report, register := true) {
     report := []
+    App.PhantomProfiles := Map()   ; a fresh load has no stale selection stubs
     if (file = "")
         file := App.ConfigFile
     if !FileExist(file) {
@@ -1069,6 +1077,8 @@ LoadConfig(file, &report, register := true) {
         }
         payload := StrReplace(payload, "{SEMICOLON}", ";")
         type := (section = "cmd") ? "cmd" : "key"
+        if (SubStr(key, 1, 3) = "hs:" || SubStr(key, 1, 3) = "px:")
+            type := "cmd"   ; hotstring/pixel triggers are command bindings (remaps are hotkey-only)
         smode := ""
         if (type = "key" && RegExMatch(payload, "\|SM:([A-Za-z]+)$", &smm)) {
             ; * advanced: a trailing |SM:Mode on a remap action is its
@@ -1103,6 +1113,7 @@ LoadConfig(file, &report, register := true) {
         newProfiles[want2] := Map()
         newPMacros[want2] := Map()
         newPSettings[want2] := Map()
+        App.PhantomProfiles[want2] := true   ; selection restored, but nothing to persist
     }
     App.ActiveProfile := want2
     SetProfileView(App.ActiveProfile)
@@ -1175,16 +1186,32 @@ SaveConfig(file := "", quiet := false) {
     return true
 }
 
+ProfileIsEmpty(name) {
+    if App.Profiles.Has(name) && App.Profiles[name].Count > 0
+        return false
+    if App.ProfileMacros.Has(name) && App.ProfileMacros[name].Count > 0
+        return false
+    if App.ProfileSettings.Has(name) && App.ProfileSettings[name].Count > 0
+        return false
+    return true
+}
+
 BuildConfigText() {
     ; sync the per-profile settings from the live App.Settings first
     if !App.ProfileSettings.Has(App.ActiveProfile)
         App.ProfileSettings[App.ActiveProfile] := Map()
-    ps := App.ProfileSettings[App.ActiveProfile]
-    for , k in ["DoRepeatOutputs", "RepeatBuffer", "RepeatDelay", "ShellCmd", "ShellHidden"]
-        ps[k] := App.Settings[k]
-    if (App.Settings["AdvancedMode"])
-        ps["SendMode"] := App.Settings["SendMode"]
-    ; * The Default profile is written FIRST, explicitly by name, so
+    ; a phantom (restored selection absent from the cfg) must not get
+    ; its live settings stamped in - that alone would persist it
+    if !(App.PhantomProfiles.Has(App.ActiveProfile) && App.Profiles.Has(App.ActiveProfile)
+            && App.Profiles[App.ActiveProfile].Count = 0) {
+        ps := App.ProfileSettings[App.ActiveProfile]
+        for , k in ["DoRepeatOutputs", "RepeatBuffer", "RepeatDelay", "ShellCmd", "ShellHidden"]
+            ps[k] := App.Settings[k]
+        if (App.Settings["AdvancedMode"])
+            ps["SendMode"] := App.Settings["SendMode"]
+    }
+
+; * The Default profile is written FIRST, explicitly by name, so
     ;   the output never depends on Map enumeration order (AHK Maps
     ;   keep insertion order, Keysharp's are sorted before enumeration).
     text := ""
@@ -1867,6 +1894,14 @@ BindCmd(id, *) {
                 SetStatus("@ expressions are not available in compiled builds")
                 return
             }
+            ahkPath := ""
+            try ahkPath := A_AhkPath
+            if (ahkPath = "") {
+                ; uncompiled Keysharp runtimes may not expose A_AhkPath
+                LogError("@ prefix unavailable: no interpreter path (A_AhkPath is empty)")
+                SetStatus("@ expressions are unavailable - no interpreter path")
+                return
+            }
             ; per-process filename: no cross-process swap race, and the
             ; startup sweep below clears leftovers (security review F4).
             ; A_ScriptHwnd is unique per process and valid on every
@@ -1875,7 +1910,16 @@ BindCmd(id, *) {
             if FileExist(file)
                 FileDelete(file)
             FileAppend(rest "`n", file, "UTF-8-RAW")
-            Run('"' A_AhkPath '" "' file '"', , "Hide")
+
+            ; per-process filename: no cross-process swap race, and the
+            ; startup sweep below clears leftovers (security review F4).
+            ; A_ScriptHwnd is unique per process and valid on every
+            ; platform (unlike a PID variable, which v2.0 lacks).
+            file := JoinPath(A_Temp, "ZxCMC_expr_" A_ScriptHwnd ".ahk")
+            if FileExist(file)
+                FileDelete(file)
+            FileAppend(rest "`n", file, "UTF-8-RAW")
+            Run('"' ahkPath '" "' file '"', , "Hide")
             return
         }
         ; Keysharp divergence: cmd.exe is not assumed to exist off
@@ -2141,7 +2185,72 @@ InitRowIcons() {
     return il
 }
 
+; --- container-relative positioning (XC/YC) ---
+
+; Keysharp positions controls relative to their CONTAINER via the
+; xc/yc options ("xc+10 inside a tab = 10px from the tab's left").
+; Plain AutoHotkey v2.0 has no xc/yc, so the layout must emit real
+; coordinates there. XC()/YC() and the per-tab tracking below keep
+; the call sites identical on both engines: on Keysharp they pass
+; the xc/yc string straight through; on plain AHK v2 they compute
+; the tab's display-area origin once (TCM_ADJUSTRECT, Win32 common
+; control) and add the same offsets to it. The .ahk only ever runs
+; on Windows, where the message is always available.
+SupportsXC() {
+    static hit := ""
+    if (hit != "")
+        return hit
+    hit := false
+    try {
+        pg := Gui()
+        pg.Add("Text", "xc+2", "")
+        pg.Destroy()
+        hit := true
+    }
+    return hit
+}
+
+; Remember the display-area origin of a tab control (plain AHK v2).
+RememberTabBase(name, ctrl) {
+    if !App.HasXC
+        return
+    ox := 0, oy := 0, ow := 0, oh := 0
+    try {
+        ctrl.GetPos(&ox, &oy, &ow, &oh)
+        r := Buffer(16, 0)
+        NumPut("Int", ox, r, 0)
+        NumPut("Int", oy, r, 4)
+        NumPut("Int", ox + ow, r, 8)
+        NumPut("Int", oy + oh, r, 12)
+        SendMessage(0x1328, 1, r.Ptr, ctrl)   ; TCM_ADJUSTRECT fits window rect -> display rect
+        App.TabOrigins[name] := [NumGet(r, 0, "Int"), NumGet(r, 4, "Int")]
+    } catch as Err {
+        ; fallback: typical Win32 tab display-area inset
+        App.TabOrigins[name] := [ox + 6, oy + 28]
+        LogError("tab origin '" name "': " Err.Message)
+    }
+}
+
+TabBaseAxis(axis) {
+    if App.TabOrigins.Has(App.CurTab)
+        return App.TabOrigins[App.CurTab][axis]
+    return 0
+}
+
+XC(off) {
+    if App.HasXC
+        return "xc+" off " "
+    return "x" (TabBaseAxis(0) + off) " "
+}
+
+YC(off) {
+    if App.HasXC
+        return "yc+" off " "
+    return "y" (TabBaseAxis(1) + off) " "
+}
+
 BuildMainGui() {
+    App.HasXC := SupportsXC()
     ; ---- layout constants (D-06: everything flows from these) ----
     ; Sizing rules for cross-toolkit robustness (AutoHotkey/Win32 vs
     ; Keysharp/WinForms vs Eto/GTK): every control gets an explicit
@@ -2237,19 +2346,21 @@ BuildMainGui() {
     tabs := g.Add("Tab3", "x" contentX " y" contentY " w" contentW " h" tabH " AltSubmit c" App.Theme["Text"]
         , ["Command Mapper", "Key Remapper", "Hotstrings", "Macros", "Profiles", "Settings", "Usage Guide"])
     App.Ui["Tab"] := tabs
+    RememberTabBase("Top", tabs)
     tabs.OnEvent("Change", TabCh)
 
     ; -- Tab 1: Command Mapper --
-    ; Keysharp: in-tab content uses xc/yc (container-RELATIVE
-    ; positioning) with 10px margins, so GTK's own tab-content inset
-    ; is not ADDED to our offsets - the cause of the oversized left
-    ; gap (user report). zxcmc.ahk keeps window-absolute x/y.
+    ; In-tab content is placed through XC()/YC() (10px margins):
+    ; container-relative xc/yc on Keysharp (so GTK's own tab-content
+    ; inset is not ADDED to our offsets - the cause of the oversized
+    ; left gap, user report), display-area-absolute x/y on plain AHK.
     tabs.UseTab(1)
+    App.CurTab := "Top"
     inW := contentW - 20                   ; in-tab content width
-    g.Add("Text", "xc+10 yc+46 w44 h22 " TransOpt() "", "Filter:")
-    App.Ui["FilterCmd"] := g.Add("Edit", "xc+60 yp w240 h22 c" App.Theme["Text"] " +Background" App.Theme["Control"], "")
+    g.Add("Text", XC(10) YC(46) " w44 h22 " TransOpt() "", "Filter:")
+    App.Ui["FilterCmd"] := g.Add("Edit", XC(60) " yp w240 h22 c" App.Theme["Text"] " +Background" App.Theme["Control"], "")
     App.Ui["FilterCmd"].OnEvent("Change", OnFilterCmdChange)
-    App.LV_Cmd := g.Add("ListView", "xc+10 yc+82 w" inW " h" lvH " NoSortHdr +Background" App.Theme["Background"]
+    App.LV_Cmd := g.Add("ListView", XC(10) YC(82) " w" inW " h" lvH " NoSortHdr +Background" App.Theme["Background"]
         , ["Key", "Command", "Status", "Window"])
     App.LV_Cmd.ModifyCol(1, 150)
     App.LV_Cmd.ModifyCol(2, lvW - 150 - 64 - 150 - 26)
@@ -2257,16 +2368,17 @@ BuildMainGui() {
     App.LV_Cmd.ModifyCol(4, 150)
     App.LV_Cmd.OnEvent("DoubleClick", LvDoubleClick)
     App.LV_Cmd.OnEvent("ContextMenu", LvContextMenu)
-    App.Ui["EmptyCmd"] := g.Add("Text", "xc+10 yc" (82 + (lvH // 2) - 11) " w" inW " h22 c" App.Theme["Hint"] " " TransOpt() " Center"
+    App.Ui["EmptyCmd"] := g.Add("Text", XC(10) YC(82 + (lvH // 2) - 11) " w" inW " h22 c" App.Theme["Hint"] " " TransOpt() " Center"
         , "No bindings yet")
     App.Ui["EmptyCmd"].Visible := false
 
     ; -- Tab 2: Key Remapper --
     tabs.UseTab(2)
-    g.Add("Text", "xc+10 yc+46 w44 h22 " TransOpt() "", "Filter:")
-    App.Ui["FilterKey"] := g.Add("Edit", "xc+60 yp w240 h22 c" App.Theme["Text"] " +Background" App.Theme["Control"], "")
+    App.CurTab := "Top"
+    g.Add("Text", XC(10) YC(46) " w44 h22 " TransOpt() "", "Filter:")
+    App.Ui["FilterKey"] := g.Add("Edit", XC(60) " yp w240 h22 c" App.Theme["Text"] " +Background" App.Theme["Control"], "")
     App.Ui["FilterKey"].OnEvent("Change", OnFilterKeyChange)
-    App.LV_Key := g.Add("ListView", "xc+10 yc+82 w" inW " h" lvH " NoSortHdr +Background" App.Theme["Background"]
+    App.LV_Key := g.Add("ListView", XC(10) YC(82) " w" inW " h" lvH " NoSortHdr +Background" App.Theme["Background"]
         , ["Key", "Output", "Status", "Window"])
     App.LV_Key.ModifyCol(1, 150)
     App.LV_Key.ModifyCol(2, lvW - 150 - 64 - 150 - 26)
@@ -2274,66 +2386,68 @@ BuildMainGui() {
     App.LV_Key.ModifyCol(4, 150)
     App.LV_Key.OnEvent("DoubleClick", LvDoubleClick)
     App.LV_Key.OnEvent("ContextMenu", LvContextMenu)
-    App.Ui["EmptyKey"] := g.Add("Text", "xc+10 yc" (82 + (lvH // 2) - 11) " w" inW " h22 c" App.Theme["Hint"] " " TransOpt() " Center"
+    App.Ui["EmptyKey"] := g.Add("Text", XC(10) YC(82 + (lvH // 2) - 11) " w" inW " h22 c" App.Theme["Hint"] " " TransOpt() " Center"
         , "No bindings yet")
     App.Ui["EmptyKey"].Visible := false
 
     ; -- Tab 5: Profiles --
     tabs.UseTab(5)
+    App.CurTab := "Top"
     ; row 1: active profile identity
-    g.Add("Text", "xc+14 yc+16 w110 h24 " TransOpt() "", "Active profile:")
-    App.Ui["ProfileDDL"] := g.Add("DDL", "xc+110 yc+8 w170 vProfDDL" FaceBg(), [])
-    App.Ui["ProfileSwitchBtn"] := g.Add("Button", "xc+315 yc+8 w100 h28" BtnBg(), "Switch")
+    g.Add("Text", XC(14) YC(16) " w110 h24 " TransOpt() "", "Active profile:")
+    App.Ui["ProfileDDL"] := g.Add("DDL", XC(110) YC(8) " w170 vProfDDL" FaceBg(), [])
+    App.Ui["ProfileSwitchBtn"] := g.Add("Button", XC(315) YC(8) " w100 h28" BtnBg(), "Switch")
     App.Ui["ProfileSwitchBtn"].OnEvent("Click", OnProfileSwitchBtn)
     ; row 2: creation and deletion
-    App.Ui["PNewBtn"] := g.Add("Button", "xc+10 yc+64 w120 h28" BtnBg(), "New profile...")
+    App.Ui["PNewBtn"] := g.Add("Button", XC(10) YC(64) " w120 h28" BtnBg(), "New profile...")
     App.Ui["PNewBtn"].OnEvent("Click", ProfileNewDialog)
-    App.Ui["PDeleteBtn"] := g.Add("Button", "xc+140 yc+64 w120 h28" BtnBg(), "Delete profile")
+    App.Ui["PDeleteBtn"] := g.Add("Button", XC(140) YC(64) " w120 h28" BtnBg(), "Delete profile")
     App.Ui["PDeleteBtn"].OnEvent("Click", ProfileDeleteOrClear)
     ; row 3: save / identity ops
-    App.Ui["PSaveBtn"] := g.Add("Button", "xc+10 yc+120 w120 h28" BtnBg(), "Save")
+    App.Ui["PSaveBtn"] := g.Add("Button", XC(10) YC(120) " w120 h28" BtnBg(), "Save")
     App.Ui["PSaveBtn"].OnEvent("Click", ProfileSave)
-    App.Ui["PSaveAsBtn"] := g.Add("Button", "xc+140 yc+120 w120 h28" BtnBg(), "Save As...")
+    App.Ui["PSaveAsBtn"] := g.Add("Button", XC(140) YC(120) " w120 h28" BtnBg(), "Save As...")
     App.Ui["PSaveAsBtn"].OnEvent("Click", ProfileSaveAs)
     ; row 4: file / profile ops
-    App.Ui["PExportBtn"] := g.Add("Button", "xc+10 yc+168 w120 h28" BtnBg(), "Export...")
+    App.Ui["PExportBtn"] := g.Add("Button", XC(10) YC(168) " w120 h28" BtnBg(), "Export...")
     App.Ui["PExportBtn"].OnEvent("Click", ProfileExport)
-    App.Ui["PImportBtn"] := g.Add("Button", "xc+140 yc+168 w120 h28" BtnBg(), "Import...")
+    App.Ui["PImportBtn"] := g.Add("Button", XC(140) YC(168) " w120 h28" BtnBg(), "Import...")
     App.Ui["PImportBtn"].OnEvent("Click", ProfileImport)
     ; row 5: rename target field (Rename uses this name)
-    g.Add("Text", "xc+10 yc+220 w460 h20 " TransOpt() "", "Rename target: type the new name for the ACTIVE profile:")
-    App.Ui["ProfNameEdit"] := g.Add("Edit", "xc+10 yc+260 w200 h22 vProfName c" App.Theme["Text"] " +Background" App.Theme["Control"], App.ActiveProfile)
-    App.Ui["PRenameBtn"] := g.Add("Button", "xc+220 yc+260 w100 h28" BtnBg(), "Rename")
+    g.Add("Text", XC(10) YC(220) " w460 h20 " TransOpt() "", "Rename target: type the new name for the ACTIVE profile:")
+    App.Ui["ProfNameEdit"] := g.Add("Edit", XC(10) YC(260) " w200 h22 vProfName c" App.Theme["Text"] " +Background" App.Theme["Control"], App.ActiveProfile)
+    App.Ui["PRenameBtn"] := g.Add("Button", XC(220) YC(260) " w100 h28" BtnBg(), "Rename")
     App.Ui["PRenameBtn"].OnEvent("Click", ProfileRename)
 
     ; -- Tab 6: Settings --
     tabs.UseTab(6)
+    App.CurTab := "Top"
     row1 := 10
-    g.Add("Text", "xc+10 yc+" row1 " w" lblW " h24 " TransOpt() "", "Repeat outputs while held (remaps only)")
-    App.Ui["RepeatBtn"] := g.Add("Button", "xc+350 yc+" (row1 - 2) " w100 h28" BtnBg()
+    g.Add("Text", XC(10)  YC(row1) " w" lblW " h24 " TransOpt() "", "Repeat outputs while held (remaps only)")
+    App.Ui["RepeatBtn"] := g.Add("Button", XC(350) YC(row1 - 2) " w100 h28" BtnBg()
         , App.Settings["DoRepeatOutputs"] ? "Disable" : "Enable")   ; caption via Add text, later via .Text only (BUG-02)
     App.Ui["RepeatBtn"].OnEvent("Click", ToggleRepeat)
 
     row2 := row1 + rowH
-    g.Add("Text", "xc+10 yc+" row2 " w" lblW " h24 " TransOpt() "", "Repeat buffer (ms)")
+    g.Add("Text", XC(10)  YC(row2) " w" lblW " h24 " TransOpt() "", "Repeat buffer (ms)")
     ; Keysharp: UpDowns are standalone NumericUpDown controls with no
     ; buddy Edit, so one control replaces the old Edit+UpDown pair.
-    App.Ui["RepeatBufUD"] := g.Add("UpDown", "xc+350 yc+" row2 " w100 h24 Range0-1000" FaceBg(), App.Settings["RepeatBuffer"])
+    App.Ui["RepeatBufUD"] := g.Add("UpDown", XC(350)  YC(row2) " w100 h24 Range0-1000" FaceBg(), App.Settings["RepeatBuffer"])
     App.Ui["RepeatBufUD"].OnEvent("Change", OnRepeatBufChange)
 
     row3 := row2 + rowH
-    g.Add("Text", "xc+10 yc+" row3 " w" lblW " h24 " TransOpt() "", "Repeat delay (ms)")
-    App.Ui["RepeatDelayUD"] := g.Add("UpDown", "xc+350 yc+" row3 " w100 h24 Range0-500" FaceBg(), App.Settings["RepeatDelay"])
+    g.Add("Text", XC(10)  YC(row3) " w" lblW " h24 " TransOpt() "", "Repeat delay (ms)")
+    App.Ui["RepeatDelayUD"] := g.Add("UpDown", XC(350)  YC(row3) " w100 h24 Range0-500" FaceBg(), App.Settings["RepeatDelay"])
     App.Ui["RepeatDelayUD"].OnEvent("Change", OnRepeatDelayChange)
 
     row4 := row3 + rowH
-    g.Add("Text", "xc+10 yc+" row4 " w" lblW " h24 " TransOpt() "", "Run at startup (requires admin)")
-    App.Ui["StartupBtn"] := g.Add("Button", "xc+350 yc+" (row4 - 2) " w100 h28" BtnBg()
+    g.Add("Text", XC(10)  YC(row4) " w" lblW " h24 " TransOpt() "", "Run at startup")
+    App.Ui["StartupBtn"] := g.Add("Button", XC(350) YC(row4 - 2) " w100 h28" BtnBg()
         , App.Settings["DoStartup"] ? "Disable" : "Enable")
     App.Ui["StartupBtn"].OnEvent("Click", ToggleStartup)
 
     row5 := row4 + rowH
-    g.Add("Text", "xc+10 yc+" row5 " w" lblW " h24 " TransOpt() "", "Shell for & commands")
+    g.Add("Text", XC(10)  YC(row5) " w" lblW " h24 " TransOpt() "", "Shell for & commands")
     shellNames := []
     shellIdx := 1
     for i, sh in App.Shells {
@@ -2343,36 +2457,36 @@ BuildMainGui() {
     }
     if (shellNames.Length = 0)
         shellNames.Push("cmd")   ; defensive: DetectShells guarantees one
-    App.Ui["ShellDDL"] := g.Add("DDL", "xc+350 yc+" (row5 - 2) " w150 Choose" shellIdx FaceBg(), shellNames)
+    App.Ui["ShellDDL"] := g.Add("DDL", XC(350) YC(row5 - 2) " w150 Choose" shellIdx FaceBg(), shellNames)
     App.Ui["ShellDDL"].OnEvent("Change", OnShellDDLChange)
 
     row6 := row5 + rowH
-    g.Add("Text", "xc+10 yc+" row6 " w" lblW " h24 " TransOpt() "", "Console window")
-    App.Ui["ShellVisBtn"] := g.Add("Button", "xc+350 yc+" (row6 - 2) " w100 h28" BtnBg()
+    g.Add("Text", XC(10)  YC(row6) " w" lblW " h24 " TransOpt() "", "Console window")
+    App.Ui["ShellVisBtn"] := g.Add("Button", XC(350) YC(row6 - 2) " w100 h28" BtnBg()
         , App.Settings["ShellHidden"] ? "Hidden" : "Visible")
     App.Ui["ShellVisBtn"].OnEvent("Click", ToggleShellVis)
 
     row7 := row6 + rowH
-    g.Add("Text", "xc+10 yc+" row7 " w" lblW " h24 " TransOpt() "", "Start as suspended (unsuspend manually to arm triggers)")
-    App.Ui["StartSuspBtn"] := g.Add("Button", "xc+350 yc+" (row7 - 2) " w100 h28" BtnBg()
+    g.Add("Text", XC(10)  YC(row7) " w" lblW " h24 " TransOpt() "", "Start as suspended (unsuspend manually to arm triggers)")
+    App.Ui["StartSuspBtn"] := g.Add("Button", XC(350) YC(row7 - 2) " w100 h28" BtnBg()
         , App.Settings["StartSuspended"] ? "Disable" : "Enable")
     App.Ui["StartSuspBtn"].OnEvent("Click", ToggleStartSuspended)
 
     row8 := row7 + rowH
-    g.Add("Text", "xc+10 yc+" row8 " w" lblW " h24 " TransOpt() "", "Autosave (save after changes, silently)")
-    App.Ui["AutosaveBtn"] := g.Add("Button", "xc+350 yc+" (row8 - 2) " w100 h28" BtnBg()
+    g.Add("Text", XC(10)  YC(row8) " w" lblW " h24 " TransOpt() "", "Autosave (save after changes, silently)")
+    App.Ui["AutosaveBtn"] := g.Add("Button", XC(350) YC(row8 - 2) " w100 h28" BtnBg()
         , App.Settings["Autosave"] ? "Disable" : "Enable")
     App.Ui["AutosaveBtn"].OnEvent("Click", ToggleAutosave)
 
     row9 := row8 + rowH
-    g.Add("Text", "xc+10 yc+" row9 " w" lblW " h24 " TransOpt() "", "Advanced mode (Send modes and advanced output options)")
-    App.Ui["AdvBtn"] := g.Add("Button", "xc+350 yc+" (row9 - 2) " w100 h28" BtnBg()
+    g.Add("Text", XC(10)  YC(row9) " w" lblW " h24 " TransOpt() "", "Advanced mode (Send modes and advanced output options)")
+    App.Ui["AdvBtn"] := g.Add("Button", XC(350) YC(row9 - 2) " w100 h28" BtnBg()
         , App.Settings["AdvancedMode"] ? "Disable" : "Enable")
     App.Ui["AdvBtn"].OnEvent("Click", ToggleAdvancedMode)
 
     row10 := row9 + rowH
-    App.Ui["SendModeLbl"] := g.Add("Text", "xc+10 yc+" row10 " w" lblW " h24 " TransOpt() "", "Default Send mode (advanced, per profile)")
-    App.Ui["SendModeDDL"] := g.Add("DDL", "xc+350 yc+" (row10 - 2) " w150 Choose" SmLabelIndex(App.Settings["SendMode"]) FaceBg(), SmLabels())
+    App.Ui["SendModeLbl"] := g.Add("Text", XC(10)  YC(row10) " w" lblW " h24 " TransOpt() "", "Default Send mode (advanced, per profile)")
+    App.Ui["SendModeDDL"] := g.Add("DDL", XC(350) YC(row10 - 2) " w150 Choose" SmLabelIndex(App.Settings["SendMode"]) FaceBg(), SmLabels())
     App.Ui["SendModeDDL"].OnEvent("Change", OnSendModeChange)
     App.Ui["SendModeLbl"].Visible := App.Settings["AdvancedMode"]
     App.Ui["SendModeDDL"].Visible := App.Settings["AdvancedMode"]
@@ -2381,75 +2495,88 @@ BuildMainGui() {
     ; -- Tab 7: Usage Guide - split into INNER sub-tabs (user request:
     ;    the single scrolling stack overflowed the window) --
     tabs.UseTab(7)
+    App.CurTab := "Top"
     SetUIThemeFont(g, "s8 c" App.Theme["Text"])
-    guide := g.Add("Tab3", "xc+4 yc+18 w" (contentW - 8) " h" (tabH - 36) " c" App.Theme["Text"]
+    guide := g.Add("Tab3", XC(4) YC(18) " w" (contentW - 8) " h" (tabH - 36) " c" App.Theme["Text"]
         , ["Getting Started", "Keys & Remaps", "Commands & Shells", "Macros & Builder", "Hotstrings & Pixel", "Profiles", "Window & Files"])
     App.Ui["GuideTabs"] := guide
+    RememberTabBase("Guide", guide)
     App.Ui["GuideTxts"] := []
     gw := contentW - 28
     ; one word-wrapped Text per sub-tab; the per-page content fits
     ; the fixed page box
     guide.UseTab(1)
-    App.Ui["GuideTxts"].Push(g.Add("Text", "xc+10 yc+10 w" gw " h" (tabH - 76) " " TransOpt() " -Wrap", "GETTING STARTED`n- ZxCMC maps keys to commands and other keys, manages macros, hotstrings, pixel triggers and profiles.`n- Everything lives in keybinds.cfg next to this script`n- Use Save to write it, Load to re-read it, and profile Save/Import for variants.`n`nQUICK START`n- Press + Add Binding, pick a trigger type, enter the action, Save`n- F1 shows/hides this window at any time (you can even rebind F1 itself)`n- Everything is reachable from the tray menu too`n`nTHE FOUR CONCEPTS`n- BINDINGS: a trigger (hotkey, hotstring or pixel) fires an action`n- MACROS: reusable Send sequences, built action-by-action in the Builder`n- PROFILES: independent sets of bindings, macros and settings`n- TRIGGERS: what makes something fire - key press, typed text, or a pixel turning a color`n`nWHERE THINGS LIVE`n- Command Mapper tab: hotkey/hotstring/pixel -> command bindings`n- Key Remapper tab: hotkey -> key/macro output bindings`n- Hotstrings tab: typed-text triggers and their replacements`n- Macros tab: the macro library (New..., Edit..., Builder...)`n- Profiles tab: save/switch/clone/import/export profiles"))
+    App.CurTab := "Guide"
+    App.Ui["GuideTxts"].Push(g.Add("Text", XC(10) YC(10) " w" gw " h" (tabH - 76) " " TransOpt() " -Wrap", "GETTING STARTED`n- ZxCMC maps keys to commands and other keys, manages macros, hotstrings, pixel triggers and profiles.`n- Everything lives in keybinds.cfg next to this script`n- Use Save to write it, Load to re-read it, and profile Save/Import for variants.`n`nQUICK START`n- Press + Add Binding, pick a trigger type, enter the action, Save`n- F1 shows/hides this window at any time (you can even rebind F1 itself)`n- Everything is reachable from the tray menu too`n`nTHE FOUR CONCEPTS`n- BINDINGS: a trigger (hotkey, hotstring or pixel) fires an action`n- MACROS: reusable Send sequences, built action-by-action in the Builder`n- PROFILES: independent sets of bindings, macros and settings`n- TRIGGERS: what makes something fire - key press, typed text, or a pixel turning a color`n`nWHERE THINGS LIVE`n- Command Mapper tab: hotkey/hotstring/pixel -> command bindings`n- Key Remapper tab: hotkey -> key/macro output bindings`n- Hotstrings tab: typed-text triggers and their replacements`n- Macros tab: the macro library (New..., Edit..., Builder...)`n- Profiles tab: save/switch/clone/import/export profiles"))
     guide.UseTab(2)
-    App.Ui["GuideTxts"].Push(g.Add("Text", "xc+10 yc+10 w" gw " h" (tabH - 76) " " TransOpt() " -Wrap", "KEY SYNTAX`n- AHK symbols: # = Win, ^ = Ctrl, ! = Alt, + = Shift (example: #^G = Win+Ctrl+G)`n- Text syntax also accepted: WIN+CTRL+ALT+G, with or without plus signs`n- Single characters written as-is: A-Z, 0-9`n`nKEY NAMES`n- Multi-character keys use their full names: Escape, Tab, Enter, Space, Backspace, Delete, Insert, Home, End, PgUp, PgDn, arrows, F1-F24`n- Numpad: Numpad0-9, NumpadEnter, NumpadAdd/Sub/Mult/Div/Dot, NumpadIns/Del/Up/Down/Left/Right/Home/End/PgUp/PgDn`n- System: AppsKey, PrintScreen, Pause, ScrollLock, CapsLock`n- Mouse: LButton, RButton, MButton, XButton1, XButton2`n- Media/Internet: Media_Play_Pause, Media_Next/Prev/Stop, Volume_Mute/Up/Down, Browser_Back/Forward/Refresh/Stop/Search/Favorites/Home`n`nREMAP OUTPUTS`n- Single key: G, !F4, ^c`n- Repeat form: !Tab 2 holds Alt and presses Tab twice`n- Macro string: sent as-is, e.g. {Enter}{Enter}abc`n`nWINDOW SCOPES`n- Append [wintitle] to scope a binding to one program: #Z[ahk_exe chrome.exe];start chrome`n- Works for hotkey AND hotstring triggers`n- The binding only fires while that window is active`n`nCONFIG GRAMMAR`n- key;action  - one binding per line`n- *key;action  - the * prefix saves the binding DISABLED`n- A line of 3+ dashes separates command from key-remap sections`n- [Profile:Name] starts a new profile; [Macros] is the legacy global-macro section (read into Default)`n- macro:Name;sequence and set:Key;Value lines store per-profile macros/settings`n- {SEMICOLON} escapes a literal semicolon inside an action"))
+    App.CurTab := "Guide"
+    App.Ui["GuideTxts"].Push(g.Add("Text", XC(10) YC(10) " w" gw " h" (tabH - 76) " " TransOpt() " -Wrap", "KEY SYNTAX`n- AHK symbols: # = Win, ^ = Ctrl, ! = Alt, + = Shift (example: #^G = Win+Ctrl+G)`n- Text syntax also accepted: WIN+CTRL+ALT+G, with or without plus signs`n- Single characters written as-is: A-Z, 0-9`n`nKEY NAMES`n- Multi-character keys use their full names: Escape, Tab, Enter, Space, Backspace, Delete, Insert, Home, End, PgUp, PgDn, arrows, F1-F24`n- Numpad: Numpad0-9, NumpadEnter, NumpadAdd/Sub/Mult/Div/Dot, NumpadIns/Del/Up/Down/Left/Right/Home/End/PgUp/PgDn`n- System: AppsKey, PrintScreen, Pause, ScrollLock, CapsLock`n- Mouse: LButton, RButton, MButton, XButton1, XButton2`n- Media/Internet: Media_Play_Pause, Media_Next/Prev/Stop, Volume_Mute/Up/Down, Browser_Back/Forward/Refresh/Stop/Search/Favorites/Home`n`nREMAP OUTPUTS`n- Single key: G, !F4, ^c`n- Repeat form: !Tab 2 holds Alt and presses Tab twice`n- Macro string: sent as-is, e.g. {Enter}{Enter}abc`n`nWINDOW SCOPES`n- Append [wintitle] to scope a binding to one program: #Z[ahk_exe chrome.exe];start chrome`n- Works for hotkey AND hotstring triggers`n- The binding only fires while that window is active`n`nCONFIG GRAMMAR`n- key;action  - one binding per line`n- *key;action  - the * prefix saves the binding DISABLED`n- A line of 3+ dashes separates command from key-remap sections`n- [Profile:Name] starts a new profile; [Macros] is the legacy global-macro section (read into Default)`n- macro:Name;sequence and set:Key;Value lines store per-profile macros/settings`n- {SEMICOLON} escapes a literal semicolon inside an action"))
     guide.UseTab(3)
-    App.Ui["GuideTxts"].Push(g.Add("Text", "xc+10 yc+10 w" gw " h" (tabH - 76) " " TransOpt() " -Wrap", "COMMAND PREFIXES (Command Mapper actions)`n- &command  runs through the shell selected in Settings, hidden or visible per the console setting`n- Bash commands are syntax-checked (bash -n) before running`n- >text  sends text/keys instead of running a program`n- @code  runs AutoHotkey code via a temporary .ahk file (not available in compiled builds)`n- Doubled prefix (&&, >>, @@) passes the character through to the default handler`n- No prefix: hidden cmd.exe (Windows) / selected shell (Keysharp)`n`nSHELLS`n- The Settings tab selects the shell for & commands (cmd.exe or PowerShell on Windows; on Linux/macOS the list is discovered from the system)`n- bash is validated with bash -n before every run - syntax errors are reported and the command is NOT executed`n- rw: runs a command and WAITS for it to finish before the next macro action; run: proceeds immediately`n`nKEY REMAP REPEAT`n- !Tab 2 = press Tab twice with Alt held`n- Repeat-while-held: the Settings tab toggles whether holding the trigger key keeps repeating the output, with buffer/delay values (per-profile)"))
+    App.CurTab := "Guide"
+    App.Ui["GuideTxts"].Push(g.Add("Text", XC(10) YC(10) " w" gw " h" (tabH - 76) " " TransOpt() " -Wrap", "COMMAND PREFIXES (Command Mapper actions)`n- &command  runs through the shell selected in Settings, hidden or visible per the console setting`n- Bash commands are syntax-checked (bash -n) before running`n- >text  sends text/keys instead of running a program`n- @code  runs AutoHotkey code via a temporary .ahk file (not available in compiled builds)`n- Doubled prefix (&&, >>, @@) passes the character through to the default handler`n- No prefix: hidden cmd.exe (Windows) / selected shell (Keysharp)`n`nSHELLS`n- The Settings tab selects the shell for & commands (cmd.exe or PowerShell on Windows; on Linux/macOS the list is discovered from the system)`n- bash is validated with bash -n before every run - syntax errors are reported and the command is NOT executed`n- rw: runs a command and WAITS for it to finish before the next macro action; run: proceeds immediately`n`nKEY REMAP REPEAT`n- !Tab 2 = press Tab twice with Alt held`n- Repeat-while-held: the Settings tab toggles whether holding the trigger key keeps repeating the output, with buffer/delay values (per-profile)"))
     guide.UseTab(4)
-    App.Ui["GuideTxts"].Push(g.Add("Text", "xc+10 yc+10 w" gw " h" (tabH - 76) " " TransOpt() " -Wrap", "MACROS`n- A macro is a reusable Send sequence stored in the macro library (Macros tab)`n- Bindings reference macros by name: a Key Remap output of macro:Name replays it`n- Editing a macro instantly updates every binding that uses it`n`nTHE BUILDER (Builder... button)`n- Build macros one action at a time: Key press (with hold duration), Key down, Key up, Wait (ms), Run command (with wait-until-return), Mouse move (X/Y, relative, hold a key while moving), Sequence (raw Send string)`n- Loop start / Loop end wrap a part of the sequence; loops need unique names`n- Endloop must match the innermost open loop, every loop must be closed before saving`n- Clone duplicates the selected action(s) in place; a multi-selection pastes after the last one`n- Test run executes the current sequence once`n`nTRIGGER MODES (per macro)`n- On key press: fires when the assigned key goes down`n- On key release: fires when the assigned key goes up`n- Repeat while held: repeats with per-macro buffer/delay`n- Pixel watch: fires while the pixel at X,Y turns to / turns from a color; the watcher polls while ZxCMC runs`n- Pixel capture may be unavailable on some compositors (watcher disables itself and logs once)`n`nMACRO GRAMMAR (stored per profile)`n- trg:press|release|repeat  trigger mode`n- rbuf:ms / rdel:ms  repeat buffer/delay`n- px:x,y,RRGGBB,to|from  pixel trigger`n- kd:Key / ku:Key / kp:Key[:holdMs]  key actions`n- w:ms  wait`n- run:cmd / rw:cmd  shell (async / wait)`n- mm:x,y,rel|abs[,hold:Key]  mouse move`n- loop:Name:Count ... endloop:Name  repetition`n- sq:string  raw Send sequence`n- snd:string  full AHK Send() syntax ({Raw}/{Blind}/{Text}, {VK}/{SC}/{U+}/{ASC nnnnn}, DownR/DownTemp; advanced mode only)`n- A literal | inside a parameter is stored as {PIPE}"))
+    App.CurTab := "Guide"
+    App.Ui["GuideTxts"].Push(g.Add("Text", XC(10) YC(10) " w" gw " h" (tabH - 76) " " TransOpt() " -Wrap", "MACROS`n- A macro is a reusable Send sequence stored in the macro library (Macros tab)`n- Bindings reference macros by name: a Key Remap output of macro:Name replays it`n- Editing a macro instantly updates every binding that uses it`n`nTHE BUILDER (Builder... button)`n- Build macros one action at a time: Key press (with hold duration), Key down, Key up, Wait (ms), Run command (with wait-until-return), Mouse move (X/Y, relative, hold a key while moving), Sequence (raw Send string)`n- Loop start / Loop end wrap a part of the sequence; loops need unique names`n- Endloop must match the innermost open loop, every loop must be closed before saving`n- Clone duplicates the selected action(s) in place; a multi-selection pastes after the last one`n- Test run executes the current sequence once`n`nTRIGGER MODES (per macro)`n- On key press: fires when the assigned key goes down`n- On key release: fires when the assigned key goes up`n- Repeat while held: repeats with per-macro buffer/delay`n- Pixel watch: fires while the pixel at X,Y turns to / turns from a color; the watcher polls while ZxCMC runs`n- Pixel capture may be unavailable on some compositors (watcher disables itself and logs once)`n`nMACRO GRAMMAR (stored per profile)`n- trg:press|release|repeat  trigger mode`n- rbuf:ms / rdel:ms  repeat buffer/delay`n- px:x,y,RRGGBB,to|from  pixel trigger`n- kd:Key / ku:Key / kp:Key[:holdMs]  key actions`n- w:ms  wait`n- run:cmd / rw:cmd  shell (async / wait)`n- mm:x,y,rel|abs[,hold:Key]  mouse move`n- loop:Name:Count ... endloop:Name  repetition`n- sq:string  raw Send sequence`n- snd:string  full AHK Send() syntax ({Raw}/{Blind}/{Text}, {VK}/{SC}/{U+}/{ASC nnnnn}, DownR/DownTemp; advanced mode only)`n- A literal | inside a parameter is stored as {PIPE}"))
     guide.UseTab(5)
-    App.Ui["GuideTxts"].Push(g.Add("Text", "xc+10 yc+10 w" gw " h" (tabH - 76) " " TransOpt() " -Wrap", "HOTSTRINGS`n- A hotstring fires when you TYPE its trigger text anywhere, then an ending character (space, Enter, etc.)`n- Set the Trigger type to Hotstring in the binding editor and type the trigger text`n- Replacement actions follow the binding grammar: >text sends text/keys, no prefix runs a command, & runs via the selected shell, macro:Name replays a library macro`n- The Hotstrings tab lists every hotstring binding with New/Edit/Delete/Toggle`n- Scope works for hotstrings too: [wintitle] limits where the text triggers`n`nPIXEL TRIGGERS`n- Trigger type Pixel: the binding fires when the screen pixel at X,Y turns to (or turns from) a color RRGGBB`n- Polls continuously while ZxCMC runs; fires once per transition and re-arms when the color clears`n- A pixel watcher disables itself (with one log entry) on platforms where pixel capture is unavailable`n`nHOTKEY TRIGGERS`n- The classic form: a hotkey (e.g. #^G) fires the action on key press`n- Multiple bindings may share a hotkey: the LATEST enabled binding wins`n- Per-app scoping via [wintitle]`n- Interception (editor dropdown): ~ passthrough, $ force hook, * wildcard; combinable - the keybind field shows the prefix (~#F), the cfg stores it as a suffix (B~$)`n- Output Send mode (advanced, Key Remap only): a per-remap override, right of Intercept"))
+    App.CurTab := "Guide"
+    App.Ui["GuideTxts"].Push(g.Add("Text", XC(10) YC(10) " w" gw " h" (tabH - 76) " " TransOpt() " -Wrap", "HOTSTRINGS`n- A hotstring fires when you TYPE its trigger text anywhere, then an ending character (space, Enter, etc.)`n- Set the Trigger type to Hotstring in the binding editor and type the trigger text`n- Replacement actions follow the binding grammar: >text sends text/keys, no prefix runs a command, & runs via the selected shell, macro:Name replays a library macro`n- The Hotstrings tab lists every hotstring binding with New/Edit/Delete/Toggle`n- Scope works for hotstrings too: [wintitle] limits where the text triggers`n`nPIXEL TRIGGERS`n- Trigger type Pixel: the binding fires when the screen pixel at X,Y turns to (or turns from) a color RRGGBB`n- Polls continuously while ZxCMC runs; fires once per transition and re-arms when the color clears`n- A pixel watcher disables itself (with one log entry) on platforms where pixel capture is unavailable`n`nHOTKEY TRIGGERS`n- The classic form: a hotkey (e.g. #^G) fires the action on key press`n- Multiple bindings may share a hotkey: the LATEST enabled binding wins`n- Per-app scoping via [wintitle]`n- Interception (editor dropdown): ~ passthrough, $ force hook, * wildcard; combinable - the keybind field shows the prefix (~#F), the cfg stores it as a suffix (B~$)`n- Output Send mode (advanced, Key Remap only): a per-remap override, right of Intercept"))
     guide.UseTab(6)
-    App.Ui["GuideTxts"].Push(g.Add("Text", "xc+10 yc+10 w" gw " h" (tabH - 76) " " TransOpt() " -Wrap", "PROFILES`n- A profile bundles bindings, macros AND the three repeat settings`n- Active profile: pick from the dropdown and press Switch (or use the tray menu)`n- New profile...: create from current settings, clone an existing profile, or start empty`n- Save: writes the active profile (one-time warning before saving into Default)`n- Save As...: copy the active profile under a new name and switch to it`n- Rename: type a new name for the ACTIVE profile (disabled for Default)`n- Export... / Import...: single-profile config files, merge-on-import`n- Delete / Clear: removes a non-Default profile (Default is cleared instead)`n- Save to... (sidebar): copies the SELECTED bindings/macros/hotstrings into any profile without switching`n`nSTORAGE`n- Profiles live as [Profile:Name] sections in keybinds.cfg`n- The Default profile is the headerless section at the top`n- macro:Name and set:Key lines inside a section carry its macros and settings`n- Profiles also carry the shell selection, console visibility and (advanced) default Send mode`n- Undo (Ctrl+Z) covers profile operations"))
+    App.CurTab := "Guide"
+    App.Ui["GuideTxts"].Push(g.Add("Text", XC(10) YC(10) " w" gw " h" (tabH - 76) " " TransOpt() " -Wrap", "PROFILES`n- A profile bundles bindings, macros AND the three repeat settings`n- Active profile: pick from the dropdown and press Switch (or use the tray menu)`n- New profile...: create from current settings, clone an existing profile, or start empty`n- Save: writes the active profile (one-time warning before saving into Default)`n- Save As...: copy the active profile under a new name and switch to it`n- Rename: type a new name for the ACTIVE profile (disabled for Default)`n- Export... / Import...: single-profile config files, merge-on-import`n- Delete / Clear: removes a non-Default profile (Default is cleared instead)`n- Save to... (sidebar): copies the SELECTED bindings/macros/hotstrings into any profile without switching`n`nSTORAGE`n- Profiles live as [Profile:Name] sections in keybinds.cfg`n- The Default profile is the headerless section at the top`n- macro:Name and set:Key lines inside a section carry its macros and settings`n- Profiles also carry the shell selection, console visibility and (advanced) default Send mode`n- Undo (Ctrl+Z) covers profile operations"))
     guide.UseTab(7)
-    App.Ui["GuideTxts"].Push(g.Add("Text", "xc+10 yc+10 w" gw " h" (tabH - 76) " " TransOpt() " -Wrap", "USING THE WINDOW`n- F1 hides/shows this window (rebindable)`n- Click a row to select; Ctrl+click or Shift+click selects several`n- Double-click a row, or press Enter, to edit; Del deletes the selected rows`n- Right-click a row to toggle/edit/delete that one binding`n- Suspend (sidebar) pauses all trigger interception until unsuspended - F1, the window and the tray stay live`n- Ctrl+Z undoes the last change (10 levels)`n- The Filter box above each list narrows rows as you type`n- Resize the window freely; the lists follow (the Usage Guide content sets the lower limit)`n`nSETTINGS TAB`n- Repeat outputs/buffer/delay: per-profile remap repeat behavior`n- Run at startup: creates the Startup shortcut (Windows, admin)`n- Shell for & commands + console visibility (both per profile)`n- Start as suspended and Autosave: trigger/persistence defaults`n- Advanced mode: reveals the default Send mode (per profile); per-remap and per-action Send modes and the builder AHK Send action are advanced too`n`nFILES`n- keybinds.cfg: bindings, remaps, macros, profiles (UTF-8)`n- zxcmcsettings.ini: settings (BOM-less UTF-8 in this port; the .ahk uses UTF-16)`n- theme.cfg: optional colors; Auto=1 follows Windows dark/light mode`n- errors: error.log inside the ZxCMC folder of the OS application-data directory`n- icons\gear.ico / keyboard.ico: list icons (missing icons degrade silently)"))
+    App.CurTab := "Guide"
+    App.Ui["GuideTxts"].Push(g.Add("Text", XC(10) YC(10) " w" gw " h" (tabH - 76) " " TransOpt() " -Wrap", "USING THE WINDOW`n- F1 hides/shows this window (rebindable)`n- Click a row to select; Ctrl+click or Shift+click selects several`n- Double-click a row, or press Enter, to edit; Del deletes the selected rows`n- Right-click a row to toggle/edit/delete that one binding`n- Suspend (sidebar) pauses all trigger interception until unsuspended - F1, the window and the tray stay live`n- Ctrl+Z undoes the last change (10 levels)`n- The Filter box above each list narrows rows as you type`n- Resize the window freely; the lists follow (the Usage Guide content sets the lower limit)`n`nSETTINGS TAB`n- Repeat outputs/buffer/delay: per-profile remap repeat behavior`n- Run at startup: creates the per-user Startup shortcut (no admin needed)`n- Shell for & commands + console visibility (both per profile)`n- Start as suspended and Autosave: trigger/persistence defaults`n- Advanced mode: reveals the default Send mode (per profile); per-remap and per-action Send modes and the builder AHK Send action are advanced too`n`nFILES`n- keybinds.cfg: bindings, remaps, macros, profiles (UTF-8)`n- zxcmcsettings.ini: settings (BOM-less UTF-8 in this port; the .ahk uses UTF-16)`n- theme.cfg: optional colors; Auto=1 follows Windows dark/light mode`n- errors: error.log inside the ZxCMC folder of the OS application-data directory`n- icons\gear.ico / keyboard.ico: list icons (missing icons degrade silently)"))
     guide.UseTab()
+    App.CurTab := "Guide"
     SetUIThemeFont(g, "s10 c" App.Theme["Text"])
 
     ; -- Tab 3: Hotstrings (triggers typed as text) --
     tabs.UseTab(3)
-    App.Ui["HsNewBtn"] := g.Add("Button", "xc+10 yc+46 w110 h28" BtnBg(), "New...")
+    App.CurTab := "Top"
+    App.Ui["HsNewBtn"] := g.Add("Button", XC(10) YC(46) " w110 h28" BtnBg(), "New...")
     App.Ui["HsNewBtn"].OnEvent("Click", HsNew)
-    App.Ui["HsEditBtn"] := g.Add("Button", "xc+134 yc+46 w110 h28" BtnBg(), "Edit...")
+    App.Ui["HsEditBtn"] := g.Add("Button", XC(134) YC(46) " w110 h28" BtnBg(), "Edit...")
     App.Ui["HsEditBtn"].OnEvent("Click", HsEditSelected)
-    App.Ui["HsDelBtn"] := g.Add("Button", "xc+258 yc+46 w110 h28" BtnBg(), "Delete")
+    App.Ui["HsDelBtn"] := g.Add("Button", XC(258) YC(46) " w110 h28" BtnBg(), "Delete")
     App.Ui["HsDelBtn"].OnEvent("Click", HsDeleteSelected)
-    App.Ui["HsTglBtn"] := g.Add("Button", "xc+382 yc+46 w110 h28" BtnBg(), "Toggle")
+    App.Ui["HsTglBtn"] := g.Add("Button", XC(382) YC(46) " w110 h28" BtnBg(), "Toggle")
     App.Ui["HsTglBtn"].OnEvent("Click", HsToggleSelected)
-    App.LV_Hotstrings := g.Add("ListView", "xc+10 yc+82 w" inW " h" lvH " NoSortHdr +Background" App.Theme["Background"]
+    App.LV_Hotstrings := g.Add("ListView", XC(10) YC(82) " w" inW " h" lvH " NoSortHdr +Background" App.Theme["Background"]
         , ["Trigger", "Output", "Status"])
     App.LV_Hotstrings.ModifyCol(1, 200)
     App.LV_Hotstrings.ModifyCol(2, lvW - 200 - 90 - 26)
     App.LV_Hotstrings.ModifyCol(3, 90)
     App.LV_Hotstrings.OnEvent("DoubleClick", HsDoubleClick)
-    App.Ui["EmptyHs"] := g.Add("Text", "xc+10 yc" (82 + (lvH // 2) - 11) " w" inW " h22 c" App.Theme["Hint"] " " TransOpt() " Center"
+    App.Ui["EmptyHs"] := g.Add("Text", XC(10) YC(82 + (lvH // 2) - 11) " w" inW " h22 c" App.Theme["Hint"] " " TransOpt() " Center"
         , "No hotstrings yet - press New...")
     App.Ui["EmptyHs"].Visible := false
 
     ; -- Tab 4: Macros (user request) - the global macro library --
     tabs.UseTab(4)
+    App.CurTab := "Top"
     ; ONE row, compact (user request), Builder first; the row ends at
     ; ~510px so the tab can still shrink below the default window size
-    App.Ui["MacroBuilderBtn"] := g.Add("Button", "xc+10 yc+46 w110 h28" BtnBg(), "Builder...")
+    App.Ui["MacroBuilderBtn"] := g.Add("Button", XC(10) YC(46) " w110 h28" BtnBg(), "Builder...")
     App.Ui["MacroBuilderBtn"].OnEvent("Click", MacroNewStructured)
-    App.Ui["MacroEditBtn"] := g.Add("Button", "xc+134 yc+46 w110 h28" BtnBg(), "Edit...")
+    App.Ui["MacroEditBtn"] := g.Add("Button", XC(134) YC(46) " w110 h28" BtnBg(), "Edit...")
     App.Ui["MacroEditBtn"].OnEvent("Click", MacroEditSelected)
-    App.Ui["MacroDelBtn"] := g.Add("Button", "xc+258 yc+46 w110 h28" BtnBg(), "Delete")
+    App.Ui["MacroDelBtn"] := g.Add("Button", XC(258) YC(46) " w110 h28" BtnBg(), "Delete")
     App.Ui["MacroDelBtn"].OnEvent("Click", MacroDeleteSelected)
-    App.Ui["MacroRunBtn"] := g.Add("Button", "xc+382 yc+46 w110 h28" BtnBg(), "Run once")
+    App.Ui["MacroRunBtn"] := g.Add("Button", XC(382) YC(46) " w110 h28" BtnBg(), "Run once")
     App.Ui["MacroRunBtn"].OnEvent("Click", MacroRunSelected)
-    App.Ui["MacroAssignBtn"] := g.Add("Button", "xc+506 yc+46 w110 h28" BtnBg(), "Assign...")
+    App.Ui["MacroAssignBtn"] := g.Add("Button", XC(506) YC(46) " w110 h28" BtnBg(), "Assign...")
     App.Ui["MacroAssignBtn"].OnEvent("Click", MacroAssignSelected)
-    App.LV_Macros := g.Add("ListView", "xc+10 yc+82 w" inW " h" lvH " NoSortHdr +Background" App.Theme["Background"]
+    App.LV_Macros := g.Add("ListView", XC(10) YC(82) " w" inW " h" lvH " NoSortHdr +Background" App.Theme["Background"]
         , ["Name", "Chars", "Preview"])
     App.LV_Macros.ModifyCol(1, 170)
     App.LV_Macros.ModifyCol(2, 60)
     App.LV_Macros.ModifyCol(3, lvW - 170 - 60 - 26)
     App.LV_Macros.OnEvent("DoubleClick", MacroDoubleClick)
-    App.Ui["EmptyMac"] := g.Add("Text", "xc+10 yc" (82 + (lvH // 2) - 11) " w" inW " h22 c" App.Theme["Hint"] " " TransOpt() " Center"
+    App.Ui["EmptyMac"] := g.Add("Text", XC(10) YC(82 + (lvH // 2) - 11) " w" inW " h22 c" App.Theme["Hint"] " " TransOpt() " Center"
         , "No macros yet - press Builder...")
     App.Ui["EmptyMac"].Visible := false
     tabs.UseTab()
+    App.CurTab := "Top"
 
     ; ---- bottom status strip (UI 2) ----
     statusY := contentY + tabH + 6
@@ -2769,20 +2896,6 @@ OnRepeatDelayChange(*) {
 ; Startup toggle (BUG-03): the flag flips ONLY after the file op
 ; succeeds inside try/catch; failures surface via status + log.
 ToggleStartup(*) {
-#if !WINDOWS
-    ; Keysharp divergence (final review F3): off-Windows there is no
-    ; A_Startup shortcut convention and Keysharp's FileCreateShortcut
-    ; writes .desktop/symlink launchers whose generated name never
-    ;   matches the .lnk probe, so the toggle would dead-end behind
-    ;   an A_IsAdmin dialog.
-    ; todo: XDG autostart (~/.config/autostart .desktop entry) off-Windows
-    SetStatus("Run at startup is Windows-only in this port")
-    return
-#else
-    if !A_IsAdmin {
-        MsgBox("This setting requires the program to have administrator privileges.`nPlease launch the program again as administrator.", "Insufficient permissions", "Iconx")
-        return
-    }
     want := App.Settings["DoStartup"] ? 0 : 1
     try {
         if (want && !FileExist(App.StartupLnk))
@@ -2797,7 +2910,6 @@ ToggleStartup(*) {
         LogError("startup toggle failed: " Err.Message)
         SetStatus("Startup toggle failed - see error log")
     }
-#endif
 }
 
 ; Shell DDL change: persist the selected shell Id. The index is
@@ -3377,6 +3489,18 @@ OpenEditor(mode := "Add", id := "", prefill := 0) {
     ed["Icp"].Choose(IcpLabelIndex(st["Icp"]))
     ed["Sm"].Choose(SmLabelIndex(st["SendMode"]))
     ed["KeyEdit"].Value := (trigIdx = 1 ? st["Icp"] : "") . dispKey
+    if (trigIdx = 3) {
+        ; pixel prefill: the PX/PY/PC/PM fields initialize with constant
+        ; values, so an Edit-mode dialog MUST restore the binding's real
+        ; trigger here or saving would silently rewrite the binding
+        pxParts := StrSplit(dispKey, ",")
+        if (pxParts.Length >= 4) {
+            try ed["PX"].Value := Integer(Trim(pxParts[1]))
+            try ed["PY"].Value := Integer(Trim(pxParts[2]))
+            try ed["PC"].Value := StrUpper(Trim(pxParts[3]))
+            try ed["PM"].Choose((Trim(pxParts[4]) = "from") ? 2 : 1)
+        }
+    }
     EditorTrigChange(ed["Trig"])
     if (trigIdx = 1 && st["Key"] != "")
         SyncPickerFromKey(ed, st["Key"])
@@ -4264,6 +4388,7 @@ RebuildPixelWatchers() {
         try {
             App.PixelWatchers.Push({Name: id, Kind: "binding", Id: id, X: Integer(p[1]), Y: Integer(p[2])
                 , Color: StrUpper(p[3]), Mode: StrLower(p[4])
+                , Scope: b.Has("Scope") ? b["Scope"] : ""
                 , Fired: false, Dead: false})
         } catch as Err {
             LogError("pixel binding trigger: " Err.Message)
@@ -4297,6 +4422,12 @@ PixelWatchTick() {
         if w.Dead
             continue
         live++
+        ; scoped pixel triggers only fire while their window is active;
+        ; transitions elsewhere are ignored and the watcher re-arms
+        if (w.Kind = "binding" && w.Scope != "" && !WinActive(w.Scope)) {
+            w.Fired := false
+            continue
+        }
         try {
             got := StrUpper(StrReplace(PixelGetColor(w.X, w.Y), "0x", ""))
             hit := (w.Mode = "to") ? (got = w.Color) : (got != w.Color)
@@ -5602,21 +5733,17 @@ ProfileImport(*) {
     file := FileSelect(3, , "Select a profile .cfg to import", "Config Files (*.cfg)")
     if (file = "")
         return
-    PushUndo()
+    rejected := []
+    tmpProfiles := Map(), tmpMacros := Map(), tmpSettings := Map()
+    tmpProfiles["Default"] := Map()
+    tmpMacros["Default"] := Map()
+    tmpSettings["Default"] := Map()
+    curP := tmpProfiles["Default"]
+    curM := tmpMacros["Default"]
+    curS := tmpSettings["Default"]
+    section := "cmd"
     added := 0
     try {
-        ; entries before any [Profile:] header land in Default (a
-        ; headerless keybinds.cfg-style file still imports)
-        if !App.Profiles.Has("Default")
-            App.Profiles["Default"] := Map()
-        if !App.ProfileMacros.Has("Default")
-            App.ProfileMacros["Default"] := Map()
-        if !App.ProfileSettings.Has("Default")
-            App.ProfileSettings["Default"] := Map()
-        curP := App.Profiles["Default"]
-        curM := App.ProfileMacros["Default"]
-        curS := App.ProfileSettings["Default"]
-        section := "cmd"
         for , raw in StrSplit(FileRead(file, "UTF-8"), "`n", "`r") {
             line := Trim(raw)
             if (line = "" || SubStr(line, 1, 1) = ";")
@@ -5629,24 +5756,32 @@ ProfileImport(*) {
             }
             if (SubStr(line, 1, 9) = "[Profile:") {
                 pname := Trim(SubStr(line, 10, StrLen(line) - 10))
-                if (pname = "")
+                if (pname = "") {
+                    rejected.Push({Line: 0, Reason: "empty profile name"})
                     continue
-                if !App.Profiles.Has(pname) {
-                    App.Profiles[pname] := Map()
-                    App.ProfileMacros[pname] := Map()
-                    App.ProfileSettings[pname] := Map()
                 }
-                curP := App.Profiles[pname]
-                curM := App.ProfileMacros[pname]
-                curS := App.ProfileSettings[pname]
+                if !tmpProfiles.Has(pname) {
+                    tmpProfiles[pname] := Map()
+                    tmpMacros[pname] := Map()
+                    tmpSettings[pname] := Map()
+                }
+                curP := tmpProfiles[pname]
+                curM := tmpMacros[pname]
+                curS := tmpSettings[pname]
                 section := "cmd"
                 continue
             }
             parts := StrSplit(line, ";", , 2)
-            if (parts.Length < 2)
+            if (parts.Length < 2) {
+                rejected.Push({Line: 0, Reason: "malformed line (expected KEY;PAYLOAD)"})
                 continue
+            }
             keypart := Trim(parts[1])
             payload := StrReplace(Trim(parts[2]), "{SEMICOLON}", ";")
+            if (keypart = "" || payload = "") {
+                rejected.Push({Line: 0, Reason: "malformed line (expected KEY;PAYLOAD)"})
+                continue
+            }
             if (SubStr(keypart, 1, 6) = "macro:" && SubStr(keypart, 7) != "") {
                 curM[SubStr(keypart, 7)] := payload
                 added++
@@ -5664,20 +5799,25 @@ ProfileImport(*) {
                     keypart := Trim(m[1])
                     scope := m[2]
                 }
-                type := (section = "key") ? "key" : "cmd"
+                ; hotstring/pixel triggers are always command bindings:
+                ; a remap section line must not produce a Type/id mismatch
+                type := "cmd"
                 id := ""
                 icp := ""
                 if (SubStr(keypart, 1, 3) = "hs:" || SubStr(keypart, 1, 3) = "px:") {
                     id := "cmd|" keypart "|" scope
                 } else {
+                    type := (section = "key") ? "key" : "cmd"
                     ; trailing ~/$/* run = the interception type
                     if RegExMatch(keypart, "[~$*]+$", &im2) {
                         icp := im2[0]
                         keypart := SubStr(keypart, 1, StrLen(keypart) - StrLen(icp))
                     }
                     nk := NormalizeKey(keypart)
-                    if (nk = "")
+                    if (nk = "") {
+                        rejected.Push({Line: 0, Reason: "invalid key '" keypart "'"})
                         continue
+                    }
                     id := type "|" nk "|" scope
                 }
                 smode := ""
@@ -5690,12 +5830,48 @@ ProfileImport(*) {
                 added++
             }
         }
+    } catch as Err {
+        LogError("profile import read: " Err.Message)
+        SetStatus("Profile import failed - see error log")
+        return
+    }
+    if (added = 0) {
+        ShowCfgReport(rejected)
+        SetStatus("Nothing to import")
+        return
+    }
+    ; gate: nothing has been applied yet - merge only on Yes
+    msg := "Import " added " entries into their profiles?`n"
+    msg .= "Rejected/skipped lines: " rejected.Length
+    if (MsgBox(msg, App.Name, "YesNo Icon! Default2") != "Yes") {
+        SetStatus("Profile import cancelled")
+        return
+    }
+    PushUndo()
+    try {
+        for pname, prof in tmpProfiles {
+            if !App.Profiles.Has(pname) {
+                App.Profiles[pname] := Map()
+                App.ProfileMacros[pname] := Map()
+                App.ProfileSettings[pname] := Map()
+            }
+            if App.PhantomProfiles.Has(pname)
+                App.PhantomProfiles.Delete(pname)   ; now carries real content
+            for id, b in prof
+                App.Profiles[pname][id] := b
+            for mn, mseq in tmpMacros[pname]
+                App.ProfileMacros[pname][mn] := mseq
+            for sk, sv in tmpSettings[pname]
+                App.ProfileSettings[pname][sk] := sv
+        }
         UnregisterAllHotkeys()   ; imported enabled bindings must activate
         RegisterAllHotkeys()
         RebuildProfilesMenu()
         RefreshGuiData()
         SetDirty()
         SetStatus("Imported " added " entries into matching profiles")
+        if (rejected.Length > 0)
+            ShowCfgReport(rejected)
     } catch as Err {
         LogError("profile import: " Err.Message)
         SetStatus("Profile import failed - see error log")
@@ -5969,24 +6145,26 @@ CloneBinding(b) {
 
 CloneBindings(profile) {
     clone := Map()
-    for id, b in profile {
-        nb := Map()
-        nb["Type"] := b["Type"]
-        nb["Key"] := b["Key"]
-        nb["Scope"] := b["Scope"]
-        nb["Action"] := b["Action"]
-        nb["Enabled"] := b["Enabled"]
-        nb["Seq"] := b["Seq"]
-        clone[id] := nb
-    }
+    for id, b in profile
+        clone[id] := CloneBinding(b)   ; every field including Icp/SendMode
     return clone
 }
 
+; Full undo snapshot: ALL profiles (bindings, macros AND per-profile
+; settings). Import replaces every profile while Undo must restore
+; every profile, so a single-profile view is not enough.
+SnapshotProfiles() {
+    profs := Map(), macros := Map(), sets := Map()
+    for name, prof in App.Profiles {
+        profs[name] := CloneBindings(prof)
+        macros[name] := App.ProfileMacros.Has(name) ? App.ProfileMacros[name].Clone() : Map()
+        sets[name] := App.ProfileSettings.Has(name) ? App.ProfileSettings[name].Clone() : Map()
+    }
+    return {Profiles: profs, Macros: macros, Settings: sets}
+}
+
 PushUndo() {
-    ; MacroLib values are plain strings, so a shallow Clone is a
-    ; complete snapshot of the library.
-    App.UndoStack.Push({Profile: App.ActiveProfile, Bindings: CloneBindings(ActiveProfileMap())
-        , Macros: App.MacroLib.Clone()})
+    App.UndoStack.Push({Active: App.ActiveProfile, Snap: SnapshotProfiles()})
     while (App.UndoStack.Length > 10)
         App.UndoStack.RemoveAt(1)   ; oldest dropped
 }
@@ -5998,22 +6176,23 @@ Undo(*) {
     }
     snap := App.UndoStack.Pop()
     UnregisterAllHotkeys()
-    App.Profiles[snap.Profile] := snap.Bindings
-    if snap.HasProp("Macros") {
-        App.MacroLib := snap.Macros
-        ; ! keep the profile store in sync with the restored view, else
-        ;   switching away and back would resurrect the undone macros
-        App.ProfileMacros[snap.Profile] := snap.Macros
-    }
-    App.ActiveProfile := snap.Profile
-    App.Settings["ActiveProfile"] := snap.Profile
+    App.Profiles := snap.Snap.Profiles
+    App.ProfileMacros := snap.Snap.Macros
+    App.ProfileSettings := snap.Snap.Settings
+    if App.Profiles.Has(snap.Active)
+        App.ActiveProfile := snap.Active
+    if !App.Profiles.Has(App.ActiveProfile)
+        App.Profiles[App.ActiveProfile] := Map()
+    ; SetProfileView points the macro view + live settings at the
+    ; restored store (and sanitizes hand-edited values)
+    SetProfileView(App.ActiveProfile)
+    App.Settings["ActiveProfile"] := App.ActiveProfile
     RegisterAllHotkeys()
     RebuildProfilesMenu()
     RefreshGuiData()
     SetDirty()
     SetStatus("Undo")
 }
-
 ; --- Macro recorder (feature 12; InputHook facts section 5) ---
 
 TrayRecordMacro(*) {

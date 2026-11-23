@@ -1,6 +1,6 @@
 # Configuration reference
 
-This document was generated from the source (both `zxcmc.ahk` and `zxcmc.ks`; where the two intentionally diverge, it is called out). Line references use `zxcmc.ahk`; the `.ks` counterpart is at the same logic location a few lines later.
+This document was generated from the source (both `zxcmc.ahk` and `zxcmc.ks`; where the two intentionally diverge, it is called out). Line references use `zxcmc.ahk`; the `.ks` counterpart is at the same logic location a few lines later. A config file executed by ZxCMC runs shell commands with your user privileges — see [SECURITY.md](SECURITY.md) before loading files from other people.
 
 ## Contents
 
@@ -91,7 +91,7 @@ A *Command Mapper* action is dispatched by its first character(s) (`BindCmd`, `z
 | `taskmgr` | *(none)* | Runs hidden through `cmd.exe`: `cmd /c taskmgr`. | Runs hidden through the **selected shell** (fallback `/bin/sh` off-Windows) — `cmd.exe` cannot be assumed off-Windows. |
 | `&sudo apt update` | `&` | Runs through the shell selected in Settings (hidden or visible per the console setting). | Same (see [shell detection](#shell-detection--bash-validation)). |
 | `>Hello world` | `>` | Sends text/keys (`Send`) instead of running a program. | Same. |
-| `@MsgBox "hi"` | `@` | Runs AutoHotkey code by writing it to a temp script (`ZxCMC_expr_<id>.ahk` in `%TEMP%`) and launching `A_AhkPath` on it. **Not available in compiled builds** (status message + log). | Same, plus the usual Keysharp caveats around `A_AhkPath` (see KNOWN-ISSUES). |
+| `@MsgBox "hi"` | `@` | Runs AutoHotkey code by writing it to a temp script (`ZxCMC_expr_<id>.ahk` in `%TEMP%`) and launching `A_AhkPath` on it. **Not available in compiled builds** (status message + log); under an uncompiled runtime an empty interpreter path is reported instead of failing silently (experimental branch). | Same. |
 | `&&foo`, `>>foo`, `@@foo` | doubled | Escape hatch: strip one character and run through the default (no-prefix) handler. | Same, except the default handler is the *selected shell* off-Windows. |
 
 The editor's **Test** button does not apply prefix dispatch: in the `.ahk` it runs commands through `cmd.exe` directly; in the `.ks` it routes through the selected shell — the same dispatcher the binding will use.
