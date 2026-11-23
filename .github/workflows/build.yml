@@ -10,6 +10,8 @@ env:
   # Pin the compiler: Keysharp always targets the host OS (no
   # cross-compilation), so the matrix below provides one runner per
   # target platform instead. Bump this to pick up a newer Keysharp.
+  # NOTE: the matrix asset names below must be updated in the same
+  # commit (the env context is not available in matrix definitions).
   KEYSHARP_VERSION: 0.0.0.18
 
 permissions:
@@ -24,13 +26,13 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            asset: keysharp-${{ env.KEYSHARP_VERSION }}-win-x64.zip
+            asset: keysharp-0.0.0.18-win-x64.zip
             ext: zip
             bin: Keysharp.exe
             exeext: .exe
             pkg: zip
           - os: ubuntu-latest
-            asset: keysharp-${{ env.KEYSHARP_VERSION }}-linux-x64.tar.gz
+            asset: keysharp-0.0.0.18-linux-x64.tar.gz
             ext: tar
             bin: Keysharp
             exeext: ''
@@ -39,7 +41,7 @@ jobs:
           # inside them has not been exercised by this project. Keep the
           # job informational until verified manually.
           - os: macos-latest
-            asset: keysharp-${{ env.KEYSHARP_VERSION }}-osx-x64.dmg
+            asset: keysharp-0.0.0.18-osx-x64.dmg
             ext: dmg
             bin: Keysharp
             exeext: ''
