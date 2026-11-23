@@ -18,7 +18,7 @@ Keysharp is a .NET-based reimplementation of AutoHotkey v2 (currently targeting 
 Pre-built binaries are attached to GitHub **Releases**, produced for every tagged commit (`v*`) by [GitHub Actions](.github/workflows/build.yml), version-stamped with the tag (e.g. `v0.1.0-beta`):
 
 - **Assemblies** (compiled once on Windows — Keysharp `.cks` output is platform-independent and cross-compatible): `zxcmc-ks-<tag>.cks` (the cross-platform Keysharp source) and `zxcmc-ahk-<tag>.cks` (the Windows-oriented `.ahk`; it runs through Keysharp on other platforms but is not designed for them).
-- **Standalone binaries** (one runner per target OS, since Keysharp cannot cross-compile): `zxcmc-full-{linux,windows,macos}-<tag>.{tar.gz,zip}` — executables of both sources plus all required runtime DLLs — and `zxcmc-min-{linux,windows,macos}-<tag>.{tar.gz,zip}`, the minimal standalone build, same shape.
+- **Standalone binaries** (one runner per target OS, since Keysharp cannot cross-compile; built only from the cross-platform `.ks`): `zxcmc-full-{linux,windows,macos}-<tag>.{tar.gz,zip}` — executable + all required runtime DLLs — and `zxcmc-min-{linux,windows,macos}-<tag>.{tar.gz,zip}`, the minimal standalone build, same shape.
 
 ---
 

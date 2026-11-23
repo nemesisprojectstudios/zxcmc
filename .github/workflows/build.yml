@@ -175,11 +175,10 @@ jobs:
           cli="./$(basename "$bin")"
           "$cli" --validate "$GITHUB_WORKSPACE/zxcmc.ahk"
           "$cli" --validate "$GITHUB_WORKSPACE/zxcmc.ks"
-          for src in zxcmc.ahk zxcmc.ks; do
-            case "$src" in
-              zxcmc.ahk) name="zxcmc" ;;
-              zxcmc.ks)  name="zxcmc-ks" ;;
-            esac
+          # standalone binaries come from the cross-platform .ks only;
+          # the .ahk ships exclusively as the zxcmc-ahk-<tag>.cks assembly
+          for src in zxcmc.ks; do
+            name="zxcmc-ks"
             "$cli" --compile exe     --dest "$GITHUB_WORKSPACE/$out/exe/$name/${name}${{ matrix.exeext }}" "$GITHUB_WORKSPACE/$src"
             "$cli" --compile exe-min --dest "$GITHUB_WORKSPACE/$out/exe-min/$name/${name}${{ matrix.exeext }}" "$GITHUB_WORKSPACE/$src"
           done
