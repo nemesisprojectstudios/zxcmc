@@ -4,18 +4,18 @@
 
 ZxCMC is a keyboard remapper and command launcher for power users: bind any key combination to a shell command, to another key press, or to a recorded macro, optionally scoped to a single application window. All bindings live in one plain-text file, `keybinds.cfg`, next to the script, and every feature is also reachable from a tabbed GUI and a tray menu.
 
-The project ships two source files plus pre-compiled assemblies:
+The project ships two source files:
 
 | Runnable | Runtime | Platforms | Notes |
 |---|---|---|---|
 | `zxcmc.ks` | [Keysharp](https://github.com/keysharp-org/Keysharp) ([docs](https://keysharp-org.github.io/KeysharpDocs), [releases](https://github.com/keysharp-org/Keysharp/releases)) | Windows / Linux / macOS | **The supported runtime.** Written in AutoHotkey v2 syntax with platform branches (`#Requires capability`, `#if WINDOWS`). |
-| `zxcmc.ahk` | Keysharp on Windows | Windows | The original AutoHotkey-style source. Syntax stays AHK v2-compatible, **but as shipped it uses Keysharp-only tab-relative GUI positioning (`xc`/`yc`), so plain AutoHotkey v2.0 currently fails at GUI construction** (see [Known issues](docs/KNOWN-ISSUES.md)). |
-| `dist/zxcmc.cks` | Keysharp (compiled) | — | Assembly build of `zxcmc.ahk`. |
-| `dist/zxcmc-ks.cks` | Keysharp (compiled) | — | Assembly build of `zxcmc.ks`. |
+| `zxcmc.ahk` | Keysharp *or* plain [AutoHotkey v2.0](https://www.autohotkey.com/) | Windows | The original AutoHotkey-style source. Runs on both Keysharp and plain AutoHotkey v2.0 (GUI offsets are translated automatically — see [Building](#building)). |
+
+Compiled `.cks` assemblies are **not committed** to the repository; they are built by [GitHub Actions](.github/workflows/build.yml) (one runner per target OS, since Keysharp cannot cross-compile) and attached to Releases on tagged commits.
 
 Keysharp is a .NET-based reimplementation of AutoHotkey v2 (currently targeting v2.1-alpha.37 as of Keysharp 0.0.0.18) and requires the **.NET 10 runtime**. Per its own README it is under active development and **not yet recommended for production**; Windows has the broadest compatibility.
 
-Pre-built binaries are attached to GitHub **Releases**: `zxcmc-{nativeOS}-{architecture}.tar.gz` (full) and, where published, `...-min.tar.gz` (minimal executable). The first release is `v0.2.0-beta` (`zxcmc-windows-x64.tar.gz` / `.zip`, `zxcmc-linux-x64.tar.gz`); from the next release on, tarballs will be version-tagged as well.
+Pre-built assemblies are attached to GitHub **Releases** as CI-built `.cks` files named per platform (e.g. `zxcmc-windows-latest.cks`), produced for every tagged version.
 
 ---
 
@@ -30,8 +30,9 @@ Pre-built binaries are attached to GitHub **Releases**: `zxcmc-{nativeOS}-{archi
 7. [Project layout](#project-layout)
 8. [Status & caveats](#status--caveats)
 9. [Known issues](#known-issues)
-10. [Building](#building)
-11. [License](#license)
+10. [Security](#security)
+11. [Building](#building)
+12. [License](#license)
 
 ---
 
@@ -41,7 +42,7 @@ Pre-built binaries are attached to GitHub **Releases**: `zxcmc-{nativeOS}-{archi
 
 - **Command mapper** — bind a hotkey to a shell command. Actions support prefixes: none (runs through the default shell), `&` (run through the shell selected in Settings, with `bash -n` syntax validation when the shell is bash — see [Shell detection](docs/CONFIGURATION.md#shell-detection--bash-validation)), `>` (send text/keys instead of running a program), `@` (run AutoHotkey code via a temporary script), and doubled `&&`/`>>`/`@@` (literal prefix passthrough).
 - **Key remapper** — bind a hotkey to another key or combination (`!Tab`), with a repeat form (`!Tab 2` = hold Alt, press Tab twice), full macro strings sent as-is (`{Enter}{Enter}abc`), and 1:N remaps (`zx` types `z` then `x`).
-- **Trigger kinds** — every command binding can trigger on a **hotkey**, a **hotstring** (typed text + ending character) or a **pixel** (screen pixel turns to/from a color); remaps stay hotkey-only. Hotkey triggers offer interception types (`~` passthrough, `$` force hook, `*` wildcard, combinable). Bindings can be scoped to one program (`[ahk_exe chrome.exe]`) — honored by hotkey and hotstring triggers (pixel scoping is on the [known issues](docs/KNOWN-ISSUES.md) list).
+- **Trigger kinds** — every command binding can trigger on a **hotkey**, a **hotstring** (typed text + ending character) or a **pixel** (screen pixel turns to/from a color); remaps stay hotkey-only. Hotkey triggers offer interception types (`~` passthrough, `$` force hook, `*` wildcard, combinable). Bindings can be scoped to one program (`[ahk_exe chrome.exe]`) — honored by hotkey, hotstring and pixel triggers.
 - **Macro Builder** — build macros one action at a time (key press/down/up with hold duration, waits, shell commands with wait-until-return, mouse moves with a held key, raw Send sequences, AHK-Send actions in Advanced mode), with named loops, per-macro trigger modes (press / release / repeat-while-held / pixel-watch), in-place Clone of selected actions, and a Test-run button.
 - **Profiles** — bindings, macros, per-profile repeat settings, and (Advanced) Send modes bundled per profile: switch / clone / create / rename / export / import / delete, plus copy-the-selection-to-any-profile (Save to...).
 - **Macro recorder** — record keystrokes from the tray menu (keyboard-only, `Esc` stops, recorded text is auto-escaped for `Send`); recordings are saved into the macro library of the active profile.
@@ -62,7 +63,7 @@ Pre-built binaries are attached to GitHub **Releases**: `zxcmc-{nativeOS}-{archi
 - **Suspend / Start as suspended** — the sidebar *Suspend* button pauses ALL trigger interception until unsuspended (F1, the window and the tray stay live); the Settings tab can start the app suspended.
 - **Autosave** — optional: changes persist silently a moment after every edit.
 - **Advanced mode** — reveals the Send-mode layer: a default Send mode (per profile), per-remap Send mode overrides, per-token modes and the AHK Send action in the Macro Builder (Send/Input/Event/Play/InputThenPlay, doc-verified on both engines).
-- **Validated import with a confirmation gate** — imported configs are parsed fully first; malformed lines are rejected and reported; nothing activates until you choose *Yes* (activate) / *No* (import disabled) / *Cancel* (undo). (The Profiles tab's import is a lighter merge flow — see [Known issues](docs/KNOWN-ISSUES.md).)
+- **Validated import with a confirmation gate** — imported configs are parsed fully first; malformed lines are rejected and reported; nothing activates until you choose *Yes* (activate) / *No* (import disabled) / *Cancel* (undo). The Profiles tab's Import... uses the same gate.
 - **Themes + auto dark/light** — `theme.cfg` with validated `RRGGBB` colors and window transparency; `Auto=1` follows the Windows dark/light app mode (Windows-only; elsewhere the dark preset is used).
 - **Repeat-while-held** — optional: remap outputs keep repeating while the bound key is physically held, with buffer/delay settings.
 - **Status strip** — transient feedback bar at the bottom (auto-clears after ~4 s), alongside tray tips.
@@ -79,16 +80,16 @@ Pre-built binaries are attached to GitHub **Releases**: `zxcmc-{nativeOS}-{archi
 ### Windows / Linux / macOS — Keysharp (supported runtime)
 
 1. Install [Keysharp](https://github.com/keysharp-org/Keysharp) ([documentation](https://keysharp-org.github.io/KeysharpDocs), [releases](https://github.com/keysharp-org/Keysharp/releases)). It requires the **.NET 10 runtime**. Windows currently has the broadest compatibility.
-2. Run `zxcmc.ks` with the `keysharp` executable (or unpack a Release tarball and run the bundled assembly). The script declares `#Requires capability InputMonitoring, InputControl, WindowMonitoring` — off-Windows, first runs may show authorization dialogs, and a denied capability makes Keysharp exit with an error naming it.
+2. Run `zxcmc.ks` with the `keysharp` executable (or run a Release's compiled `.cks` assembly with Keysharp). The script declares `#Requires capability InputMonitoring, InputControl, WindowMonitoring` — off-Windows, first runs may show authorization dialogs, and a denied capability makes Keysharp exit with an error naming it.
 3. Optional: launch with `--silent` to start with the window hidden (this is the argument the built-in *Run at startup* shortcut uses).
 
 Expected files next to the script (all optional — sensible defaults apply if missing): `keybinds.cfg`, `theme.cfg`, `zxcmcsettings.ini`, `icons/`.
 
 On Linux, Keysharp's GTK backend uses the active user's GTK theme; `theme.cfg` colors are effectively a Windows-only feature (Linux keeps its native look). A misconfigured GTK theme can produce visual artifacts or discoloration in the UI on Linux. On Windows, Keysharp renders GUI operations through native WinUI, so the `theme.cfg` configuration applies as documented.
 
-### Windows — plain AutoHotkey v2.0 (not currently working)
+### Windows — plain AutoHotkey v2.0 (works too)
 
-`zxcmc.ahk` is written in AutoHotkey v2 syntax and deliberately avoids v2.1-only language features, `#Requires AutoHotkey v2.0` included. However, its tab layout uses Keysharp's container-relative `xc`/`yc` positioning options, which AutoHotkey v2 rejects — the GUI build fails at startup with an invalid-option error. Until the layout is ported to plain `x`/`y` offsets (tracked in [Known issues](docs/KNOWN-ISSUES.md)), run ZxCMC through Keysharp on all platforms.
+`zxcmc.ahk` is written in AutoHotkey v2 syntax and works on plain AutoHotkey v2.0 as well as under Keysharp. Its tab layout uses `XC()`/`YC()` helper calls that emit Keysharp's tab-relative `xc`/`yc` options when the runtime supports them and computed absolute `x`/`y` coordinates (derived from the Tab control's display area) on AutoHotkey v2.0, so the same layout is produced on both. Only the pixel-trigger and theming caveats of Keysharp do not apply — plain AHK v2.0 has native Windows behavior.
 
 ### Runtime support caveat
 
@@ -161,7 +162,7 @@ The main window has a left sidebar of action buttons, **seven tabs** (Command Ma
 
 The complete tour — sidebar buttons, binding editing, profiles, the export/import confirmation gate, the macro recorder and Macro Builder, keyboard shortcuts and the tray menu — is in [docs/USAGE.md](docs/USAGE.md). The app also ships this guide in its built-in **Usage Guide** tab.
 
-**A note on trust:** ZxCMC executes what you configure — shell commands (`&`, no-prefix actions, macro `run:`/`rw:` actions) and even AutoHotkey code (`@`). Treat `keybinds.cfg` files from other people like scripts: the import gate lets you load one disabled (*No*) to inspect it before activating.
+**A note on trust:** ZxCMC executes what you configure — shell commands, key sends, and with the `@` prefix even AutoHotkey code. Treat `keybinds.cfg` files from other people like scripts. Read the full trust model, review checklist and release-verification guidance in [docs/SECURITY.md](docs/SECURITY.md).
 
 ---
 
@@ -172,9 +173,9 @@ The complete tour — sidebar buttons, binding editing, profiles, the export/imp
 - **"Hotkey registration failed for X"** — the key could not be registered (typically another application owns it, or the OS rejects it). The failure is logged; the binding stays in the list so you can rebind it to another key.
 - **Settings not saving / mojibake in the INI.** On AutoHotkey the INI must stay UTF-16 (the app re-normalizes it automatically); the Keysharp port normalizes it to BOM-less UTF-8. Either suite can read the other's output for the ASCII values stored here.
 - **`@` actions don't run in a compiled build** — by design; the `@` prefix needs `A_AhkPath` and is disabled when the script is compiled.
-- **Startup toggle says it needs admin** — creating/removing the Startup-folder shortcut currently requires elevation; relaunch as administrator to use it.
+- **Startup toggle** raises a tray tip when the shortcut cannot be written; the Startup folder is per-user, so no elevation is involved.
 - **Keysharp/Linux specifics** — capability prompts on first run; hotkey capture Partial off-Windows (see [Status & caveats](#status--caveats)); startup links are freedesktop `.desktop` entries whose generated name may not match the toggle's check.
-- **Bugs and code-level defects currently open** are tracked with file/line references in [docs/KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md).
+- **Bugs and code-level defects currently open** are tracked with status in [docs/KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md).
 
 ---
 
@@ -182,12 +183,12 @@ The complete tour — sidebar buttons, binding editing, profiles, the export/imp
 
 | Path | Purpose |
 |---|---|
-| `zxcmc.ahk` | The original implementation (~6000 lines; class-based state, hotkey engine, GUI, tray, config I/O). Currently targets Keysharp on Windows — see the runtime note above. |
+| `zxcmc.ahk` | The original implementation (~6000 lines; class-based state, hotkey engine, GUI, tray, config I/O). Runs under Keysharp and plain AutoHotkey v2.0. |
 | `zxcmc.ks` | The Keysharp cross-platform port — a mechanical mirror of the `.ahk` plus platform branches (`#Requires capability`, `#if WINDOWS` guards, restructured UpDown controls) so the two stay diffable. |
-| `dist/` | Keysharp compile artifacts: `zxcmc.cks` (from the `.ahk`) and `zxcmc-ks.cks` (from the `.ks`). |
+| `.github/workflows/build.yml` | CI: validates both scripts and compiles them with Keysharp on Windows, Linux and macOS runners; tag builds are attached to Releases. |
 | `examples/` | Titled examples for the configuration files created at runtime. |
 | `icons/` | Row icons for the list views — `gear.ico` (command bindings), `keyboard.ico` (key remaps). |
-| `docs/` | The full configuration reference, usage guide and open-issues list. |
+| `docs/` | The full configuration reference, usage guide, security note and issue tracker. |
 | `.gitignore` | Ignores local notes, test harnesses, configuration/save files and build temp files. |
 
 ---
@@ -209,15 +210,35 @@ The complete tour — sidebar buttons, binding editing, profiles, the export/imp
 
 ## Known issues
 
-Open, code-level defects are tracked in [docs/KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md) with file/line references, severity and workarounds. Headline items: editing a pixel-triggered binding silently resets its trigger; cancelling a full config import only partially reverts it; and `zxcmc.ahk` does not currently run on plain AutoHotkey v2.0 (see above). Read the file before relying on pixel triggers or import cancellation.
+Code-level defects and their status (open / fixed on `Experimental` / by
+design) are tracked in [docs/KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md). The only
+open item is the Macro Builder window resize under Linux/GTK, which is
+deliberately left as-is.
+
+---
+
+## Security
+
+ZxCMC executes what you configure with your full user privileges. Before
+importing or enabling a config file written by anyone else, read
+[docs/SECURITY.md](docs/SECURITY.md) — it covers what actually runs, what the
+import gate does and does not protect against, a review checklist, and how to
+verify a release build.
 
 ---
 
 ## Building
 
-The `dist/*.cks` assemblies were produced with Keysharp's compiler (assembly output) against Keysharp **0.0.0.18**; both `.cks` files correspond to the current sources. When you change either script, recompile and commit both artifacts together so they never drift apart — source and binaries intentionally live in the same commit for this reason.
+Compiled `.cks` assemblies are produced by [GitHub Actions](.github/workflows/build.yml) rather than committed: Keysharp always compiles for the OS it runs on (no cross-compilation), so the workflow runs the same steps on Windows, Linux and macOS runners — download Keysharp `${{ env.KEYSHARP_VERSION }}` (pinned via the `KEYSHARP_VERSION` env var in the workflow), `--validate` both scripts, then `--compile` each with `--dest` into per-OS artifacts. Tag pushes (`v*`) attach the artifacts to the GitHub Release.
 
-To validate syntax without launching the GUI: run either script under Keysharp and watch for load errors, or (Windows/AutoHotkey) `AutoHotkey.exe /Validate /ErrorStdOut zxcmc.ahk` — exit code 0 means the file parses cleanly.
+You can do the same manually on any platform with [Keysharp](https://github.com/keysharp-org/Keysharp/releases) and the .NET 10 runtime installed:
+
+```sh
+keysharp --validate zxcmc.ahk
+keysharp --compile zxcmc.ahk --dest zxcmc.cks
+```
+
+To validate syntax without launching the GUI: `keysharp --validate <script>` (exit code 0 means it parses cleanly), or (Windows/AutoHotkey) `AutoHotkey.exe /Validate /ErrorStdOut zxcmc.ahk`.
 
 ---
 

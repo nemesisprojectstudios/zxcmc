@@ -91,25 +91,22 @@ A status line at the bottom of the window reports the result of every action
 - Pixel triggers: set trigger type **Pixel**, give X,Y and an RRGGBB color, and
   choose "turns to" or "turns from". The watcher polls continuously while ZxCMC
   runs, fires once per transition, and re-arms when the color clears. Where
-  pixel capture is unavailable the watcher disables itself and logs once.
-  **Known issue:** editing an existing pixel binding loses its stored
-  coordinates in the current build — see
-  [KNOWN-ISSUES.md](KNOWN-ISSUES.md#1-editing-a-pixel-binding-destroys-its-trigger).
+  pixel capture is unavailable the watcher disables itself and logs once. A
+  binding's `[wintitle]` scope is honored while the trigger is active: if the
+  scoped window is not the active window, the watcher stays armed but does
+  not fire.
 
 ## Importing, exporting, loading
 
 - **Import** (sidebar) shows a preview gate before anything is applied:
   - **Yes** replaces the configuration with the file's contents.
   - **No** closes the file without changing anything.
-  - **Cancel** behaves like "No" from the file's perspective; an **Undo**
-    (Ctrl+Z) snapshot is always pushed over the active profile. Note that the
-    undo snapshot covers only the *active* profile, while an import with
-    multiple `[Profile:]` sections replaces *all* profiles — profiles beyond
-    the active one cannot be restored. Details in
-    [KNOWN-ISSUES.md](KNOWN-ISSUES.md#2-undo-does-not-cover-import-fully).
-- **Profile Import** on the Profiles tab imports a single-profile config with
-  merge semantics directly into the current profile set (no preview gate;
-  malformed lines are skipped silently).
+  - **Cancel** aborts without changes. **Undo** (Ctrl+Z) can always revert an
+    accepted import: the snapshot covers *all* profiles (bindings, macros and
+    per-profile settings), not just the active one.
+- **Profile Import** on the Profiles tab parses the file first, reports
+  rejected lines with reasons, and shows the same Yes/No/Cancel gate; nothing
+  is merged into the current profile set until you accept.
 - Saving is atomic: the file is written to a `.tmp` file first, then renamed,
   so a crash mid-save cannot corrupt `keybinds.cfg`.
 
@@ -169,8 +166,9 @@ Each macro binding (Key Remapper) makes a key press trigger the macro:
 
 `run:` starts a command asynchronously, `rw:` waits for it to finish before
 proceeding (visible in the action dialog as the "Wait until return" checkbox).
-In the current build both run **hidden** regardless of the console setting —
-see [KNOWN-ISSUES.md](KNOWN-ISSUES.md#8-macro-runrw-commands-always-run-hidden).
+Both run in a **hidden** console by design: macro steps should not interrupt
+you with windows (use a Command Mapper binding if you want a visible
+console).
 
 ## Recording macros
 
@@ -207,7 +205,7 @@ with it:
 |---|---|---|
 | Repeat outputs while held (remaps only) | per profile | Repeat a remap's output while the trigger stays down |
 | Repeat buffer / delay (ms) | per profile | Tuning for the repeat loop |
-| Run at startup | machine | Needs admin on Windows (per-user Startup folder entry; see [KNOWN-ISSUES.md](KNOWN-ISSUES.md#6-run-at-startup-requires-an-admin-token-unnecessarily)) |
+| Run at startup | machine | Writes a per-user Startup-folder shortcut (Windows: `.lnk`; elsewhere a freedesktop `.desktop` entry whose generated name may not match the toggle's check) |
 | Shell for & commands | per profile | cmd.exe / PowerShell on Windows; on Linux/macOS the list is discovered from the system |
 | Console visibility | per profile | Whether `&` commands open a console window |
 | Start as suspended | global | Begin suspended |
